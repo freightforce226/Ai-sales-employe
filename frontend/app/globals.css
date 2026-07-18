@@ -1,0 +1,106 @@
+@import "tailwindcss";
+
+/**
+ * Purpose: Centrally defines CSS custom properties and theme tokens for FreightForce AI.
+ * Responsibility: Registering CSS-based design tokens for colors, surfaces, borders, and mapping them to Tailwind utility classes.
+ */
+
+:root {
+  /* Design Token Colors (Enterprise, Premium, Luxury System) */
+  --brand-primary: #2563EB;
+  --brand-primary-hover: #1D4ED8;
+  --brand-primary-focus: rgba(37, 99, 235, 0.12);
+
+  --bg-primary: #F8FAFC; /* Off-white canvas background */
+  --bg-surface: #FFFFFF; /* Pure white surface cards */
+  --bg-secondary: #F1F5F9; /* Elevated surface background */
+  
+  --border-color: #E2E8F0; /* border-subtle */
+  --border-focus: #2563EB;
+
+  --text-primary: #0F172A; /* text-primary */
+  --text-secondary: #334155; /* text-secondary */
+  --text-muted: #64748B; /* text-muted */
+  --text-inverse: #FFFFFF;
+
+  --status-success: #059669;
+  --status-success-bg: #F0FDF4;
+  --status-warning: #D97706;
+  --status-warning-bg: #FFFBEB;
+  --status-danger: #DC2626;
+  --status-danger-bg: #FFF1F2;
+
+  --sidebar-bg: #0F1829; /* Deep navy sidebar */
+  --sidebar-border: rgba(255, 255, 255, 0.08);
+  --sidebar-text: #94A3B8;
+  --sidebar-text-active: #FFFFFF;
+  
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+}
+
+/* Dark Mode Overrides (Optional fallback variables matching the same low-noise aesthetic) */
+[data-theme="dark"] {
+  --bg-primary: #0B0F19;
+  --bg-surface: #111827;
+  --bg-secondary: #1F2937;
+  
+  --border-color: #1F2937;
+
+  --text-primary: #F9FAFB;
+  --text-secondary: #9CA3AF;
+  --text-muted: #6B7280;
+
+  --status-success-bg: rgba(18, 183, 106, 0.1);
+  --status-warning-bg: rgba(247, 144, 9, 0.1);
+  --status-danger-bg: rgba(240, 68, 56, 0.1);
+}
+
+@theme inline {
+  --color-brand-primary: var(--brand-primary);
+  --color-brand-primary-hover: var(--brand-primary-hover);
+  --color-brand-primary-focus: var(--brand-primary-focus);
+
+  --color-bg-primary: var(--bg-primary);
+  --color-bg-surface: var(--bg-surface);
+  --color-bg-secondary: var(--bg-secondary);
+
+  --color-border-color: var(--border-color);
+  --color-border-focus: var(--border-focus);
+
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+  --color-text-inverse: var(--text-inverse);
+
+  --color-status-success: var(--status-success);
+  --color-status-success-bg: var(--status-success-bg);
+  --color-status-warning: var(--status-warning);
+  --color-status-warning-bg: var(--status-warning-bg);
+  --color-status-danger: var(--status-danger);
+  --color-status-danger-bg: var(--status-danger-bg);
+
+  --color-sidebar-bg: var(--sidebar-bg);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-text: var(--sidebar-text);
+  --color-sidebar-text-active: var(--sidebar-text-active);
+
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Base input and button focus state resetting */
+*:focus-visible {
+  outline: 2px solid var(--brand-primary);
+  outline-offset: 2px;
+}
