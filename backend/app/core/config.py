@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     n8n_webhook_url: str = "http://localhost:5678/webhook/customer-import"
     n8n_engagement_webhook_url: str = "http://localhost:5678/webhook/engagement-run"
     oauth_state_secret: str
+    gemini_api_key: str | None = None
 
     supabase_url: str
     supabase_anon_key: str
@@ -35,6 +36,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     app_port: int = 8000
     allowed_origins: str = "*"
+
+    ai_reply_recovery_interval_minutes: int = 5
+    ai_reply_lock_timeout_minutes: int = 15
 
     @property
     def allowed_origins_list(self) -> list[str]:

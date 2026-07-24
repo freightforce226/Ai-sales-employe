@@ -99,5 +99,91 @@ async def run_engagement_migrations():
 
     logger.info("Database schema migrations completed successfully.")
 
+
+async def run_ai_reply_migrations():
+    """
+    Executes database migrations to create and seed the organization_ai_settings table.
+    """
+    logger.info("Starting database schema migrations for AI Reply Engine...")
+    async with AsyncSessionLocal() as session:
+        try:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS organization_ai_settings (
+                    organization_id UUID PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+                    ai_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    company_name CHARACTER VARYING,
+                    reply_tone CHARACTER VARYING DEFAULT 'professional',
+                    ai_writing_instructions TEXT,
+                    email_signature TEXT,
+                    default_cc_emails JSONB DEFAULT '[]'::jsonb,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                )
+            """))
+            await session.commit()
+            logger.info("Verified table: organization_ai_settings")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed migrating organization_ai_settings", error=str(e))
+
+        # Insert default settings rows for any organizations that don't have them
+        try:
+            await session.execute(text("""
+                INSERT INTO organization_ai_settings (organization_id)
+                SELECT id FROM organizations
+                ON CONFLICT (organization_id) DO NOTHING
+            """))
+            await session.commit()
+            logger.info("Initialized default AI reply settings for organizations")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed to populate default AI reply settings", error=str(e))
+
+        # Migrations for Stale Lock Recovery
+        try:
+            # 1. Add queued_at column
+            await session.execute(text("""
+                ALTER TABLE email_log 
+                ADD COLUMN IF NOT EXISTS queued_at TIMESTAMP WITH TIME ZONE NULL
+            """))
+            await session.commit()
+            
+            # 2. Create index for recovery performance
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_email_log_queued_recovery 
+                ON email_log (delivery_status, queued_at)
+            """))
+            await session.commit()
+            
+            # 3. Verification check
+            res_col = await session.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'email_log' AND column_name = 'queued_at'
+            """))
+            col_verified = res_col.fetchone() is not None
+            
+            res_idx = await session.execute(text("""
+                SELECT indexname 
+                FROM pg_indexes 
+                WHERE tablename = 'email_log' AND indexname = 'idx_email_log_queued_recovery'
+            """))
+            idx_verified = res_idx.fetchone() is not None
+            
+            if col_verified and idx_verified:
+                logger.info("Running AI Reply database migrations...")
+                logger.info("OK: queued_at column verified.")
+                logger.info("OK: idx_email_log_queued_recovery index verified.")
+                logger.info("OK: AI Reply schema up to date.")
+            else:
+                logger.error("Verification failed: queued_at or index missing from schema metadata.")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed executing or verifying AI Reply lock recovery migrations", error=str(e))
+
+
 if __name__ == "__main__":
-    asyncio.run(run_engagement_migrations())
+    async def main():
+        await run_engagement_migrations()
+        await run_ai_reply_migrations()
+    asyncio.run(main())

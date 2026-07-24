@@ -34,6 +34,8 @@ class EmailRequest(BaseModel):
     internet_message_id: Optional[str] = Field(None, description="RFC5322 Message-ID")
     references: Optional[str] = Field(None, description="RFC5322 references header value")
     in_reply_to: Optional[str] = Field(None, description="RFC5322 in-reply-to message ID")
+    parent_message_id: Optional[str] = Field(None, description="Graph ID of parent message to reply to")
+
 
     @field_validator("customer_email", mode="before")
     @classmethod

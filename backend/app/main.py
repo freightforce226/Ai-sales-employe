@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import email, oauth, auth, dashboard, csv_import, customers, templates, attachments, engagement, follow_ups
+from app.api.routes import email, oauth, auth, dashboard, csv_import, customers, templates, attachments, engagement, follow_ups, ai_reply
 from app.core.config import get_settings
 from app.core.exceptions import (
     EmailSendError,
@@ -48,9 +48,10 @@ async def lifespan(app: FastAPI):
     )
     
     # Initialize DB schemas/tables if missing
-    from app.db.migrations import run_engagement_migrations
+    from app.db.migrations import run_engagement_migrations, run_ai_reply_migrations
     try:
         await run_engagement_migrations()
+        await run_ai_reply_migrations()
         from sqlalchemy import text
         from app.db.session import AsyncSessionLocal
         async with AsyncSessionLocal() as session:
@@ -118,7 +119,41 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Failed to initialize database schemas", error=str(e))
 
+    # Spawn background task loop for stale lock recovery
+    import asyncio
+    from app.services.ai_reply_service import AIReplyService
+    from app.db.session import AsyncSessionLocal
+
+    async def run_stale_lock_recovery():
+        logger.info(
+            "Stale AI reply lock recovery worker started.",
+            interval_minutes=settings.ai_reply_recovery_interval_minutes,
+            lock_timeout_minutes=settings.ai_reply_lock_timeout_minutes
+        )
+        # Immediate scan on startup
+        try:
+            async with AsyncSessionLocal() as session:
+                service = AIReplyService(session)
+                await service.recover_stale_locks(timeout_minutes=settings.ai_reply_lock_timeout_minutes)
+        except Exception as startup_scan_err:
+            logger.error("Error during initial startup stale lock recovery scan", error=str(startup_scan_err))
+
+        while True:
+            try:
+                await asyncio.sleep(settings.ai_reply_recovery_interval_minutes * 60)
+                async with AsyncSessionLocal() as session:
+                    service = AIReplyService(session)
+                    await service.recover_stale_locks(timeout_minutes=settings.ai_reply_lock_timeout_minutes)
+            except asyncio.CancelledError:
+                logger.info("Stale AI reply lock recovery task cancelled.")
+                break
+            except Exception as loop_err:
+                logger.error("Error in stale AI reply lock recovery loop", error=str(loop_err))
+
+    recovery_task = asyncio.create_task(run_stale_lock_recovery())
+
     yield
+    recovery_task.cancel()
     logger.info("Shutting down FastAPI application")
 
 
@@ -240,6 +275,7 @@ async def log_requests_middleware(request: Request, call_next):
 
 
 from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -260,8 +296,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     
     return JSONResponse(
         status_code=422,
-        content={"detail": exc.errors()}
+        content={"detail": jsonable_encoder(exc.errors())}
     )
+
 
 
 @app.exception_handler(TenantNotFoundError)
@@ -306,6 +343,7 @@ app.include_router(organization.router)
 app.include_router(signature.router)
 app.include_router(follow_ups.router, prefix="/api/v1/follow-ups")
 app.include_router(follow_ups.router, prefix="/api/v1/followups")
+app.include_router(ai_reply.router)
 
 
 @app.get("/health", tags=["Health"])

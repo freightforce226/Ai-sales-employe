@@ -188,4 +188,164 @@ class MicrosoftGraphClient:
             "delta_link": new_delta_link
         }
 
+    async def get_sent_message_metadata(
+        self, access_token: str, subject: str, to_email: str, max_retries: int = 4, delay_seconds: float = 0.5
+    ) -> dict:
+        """
+        Polls the Sent Items folder for the most recently sent message matching the given subject
+        to resolve conversationId, internetMessageId, conversationIndex, and Graph message ID.
+        """
+        import asyncio
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        
+        # Escape subject quotes for the OData filter
+        safe_subject = subject.replace("'", "''")
+        
+        # Filter by subject and order by receivedDateTime desc to get the latest
+        url = f"https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages?$filter=subject eq '{safe_subject}'&$orderby=receivedDateTime desc&$select=id,conversationId,internetMessageId,conversationIndex&$top=5"
+        
+        start_time = time.perf_counter()
+        
+        for attempt in range(max_retries):
+            try:
+                # Add delay before polling to allow Graph to process
+                await asyncio.sleep(delay_seconds)
+                
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    res = await client.get(url, headers=headers)
+                    if res.status_code == 200:
+                        data = res.json()
+                        messages = data.get("value", [])
+                        
+                        if messages:
+                            msg = messages[0]
+                            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+                            logger.info(
+                                "Sent Items retrieval completed successfully",
+                                attempt=attempt + 1,
+                                elapsed_ms=elapsed_ms,
+                                conversation_id=msg.get("conversationId"),
+                                internet_message_id=msg.get("internetMessageId")
+                            )
+                            return {
+                                "id": msg.get("id"),
+                                "conversation_id": msg.get("conversationId"),
+                                "internet_message_id": msg.get("internetMessageId"),
+                                "conversation_index": msg.get("conversationIndex"),
+                                "retrieval_success": True,
+                                "retrieval_time_ms": elapsed_ms
+                            }
+                            
+                logger.info(f"Sent message not found in Sent Items on attempt {attempt + 1}, retrying...")
+            except Exception as e:
+                logger.warning(f"Error on Sent Items retrieval attempt {attempt + 1}: {str(e)}")
+                
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        logger.warning(f"Failed to retrieve sent message metadata from Sent Items", elapsed_ms=elapsed_ms)
+        return {
+            "id": None,
+            "conversation_id": None,
+            "internet_message_id": None,
+            "conversation_index": None,
+            "retrieval_success": False,
+            "retrieval_time_ms": elapsed_ms
+        }
+
+    async def create_reply_draft(self, access_token: str, parent_message_id: str) -> str:
+        """
+        Creates a draft reply to a specific parent message inside Outlook.
+        Returns the draft message ID.
+        """
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        url = f"https://graph.microsoft.com/v1.0/me/messages/{parent_message_id}/createReply"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            logger.info("Executing Graph API createReply draft request", parent_message_id=parent_message_id)
+            res = await client.post(url, headers=headers, json={})
+            if res.status_code in (200, 201):
+                draft_id = res.json().get("id")
+                logger.info("Successfully created reply draft", draft_id=draft_id)
+                return draft_id
+            
+            logger.error("Failed to create Graph reply draft", status_code=res.status_code, text=res.text)
+            raise GraphApiError(f"Graph API createReply error {res.status_code}: {res.text}")
+
+    async def update_message_draft(self, access_token: str, draft_id: str, html_content: str, cc_emails: list = None) -> None:
+        """
+        Updates a draft message's body content and CC recipients list.
+        """
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        url = f"https://graph.microsoft.com/v1.0/me/messages/{draft_id}"
+        
+        payload = {
+            "body": {
+                "contentType": "HTML",
+                "content": html_content
+            }
+        }
+        if cc_emails:
+            payload["ccRecipients"] = [
+                {"emailAddress": {"address": str(email)}} for email in cc_emails
+            ]
+            
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            logger.info("Executing Graph API update draft request", draft_id=draft_id)
+            res = await client.patch(url, headers=headers, json=payload)
+            if res.status_code in (200, 204):
+                logger.info("Successfully updated reply draft content", draft_id=draft_id)
+                return
+                
+            logger.error("Failed to update Graph reply draft", status_code=res.status_code, text=res.text)
+            raise GraphApiError(f"Graph API patch draft error {res.status_code}: {res.text}")
+
+    async def send_draft(self, access_token: str, draft_id: str) -> None:
+        """
+        Sends a prepared draft message.
+        """
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Length": "0"
+        }
+        url = f"https://graph.microsoft.com/v1.0/me/messages/{draft_id}/send"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            logger.info("Executing Graph API send draft request", draft_id=draft_id)
+            res = await client.post(url, headers=headers)
+            if res.status_code in (202, 204):
+                logger.info("Successfully sent reply draft", draft_id=draft_id)
+                return
+                
+            logger.error("Failed to send Graph reply draft", status_code=res.status_code, text=res.text)
+            raise GraphApiError(f"Graph API send draft error {res.status_code}: {res.text}")
+
+    async def delete_draft(self, access_token: str, draft_id: str) -> None:
+        """
+        Deletes a draft message.
+        """
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+        }
+        url = f"https://graph.microsoft.com/v1.0/me/messages/{draft_id}"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            logger.info("Executing Graph API delete draft request", draft_id=draft_id)
+            res = await client.delete(url, headers=headers)
+            if res.status_code in (204, 404):
+                logger.info("Successfully deleted draft", draft_id=draft_id)
+                return
+                
+            logger.error("Failed to delete Graph draft", status_code=res.status_code, text=res.text)
+            raise GraphApiError(f"Graph API delete draft error {res.status_code}: {res.text}")
+
+
+
 

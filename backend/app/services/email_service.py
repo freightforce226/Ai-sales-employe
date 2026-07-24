@@ -121,6 +121,92 @@ class EmailService:
         self.token_service = TokenService(session)
         self.graph_client = MicrosoftGraphClient()
 
+    async def _send_new_email(
+        self,
+        request: EmailRequest,
+        access_token: str,
+        final_html_body: str,
+        graph_attachments: list,
+        prefix: str
+    ) -> str:
+        from app.core.debug_logger import log_to_request_file
+        log_to_request_file("Executing Scenario 2: Standard Outbound Email (sendMail)")
+        return await self.graph_client.send_email(
+            access_token=access_token,
+            subject=request.subject,
+            html_content=final_html_body,
+            to_email=request.customer_email,
+            attachments=graph_attachments
+        )
+
+    async def _send_threaded_reply(
+        self,
+        request: EmailRequest,
+        access_token: str,
+        final_html_body: str,
+        graph_attachments: list,
+        parent_message_id: str,
+        cc_list: list,
+        prefix: str
+    ) -> str:
+        from app.core.debug_logger import log_to_request_file
+        log_to_request_file(f"Executing Scenario 1: Threaded Reply on parent message ID {parent_message_id}")
+        draft_id = None
+        max_attempts = 3
+        last_err = None
+        
+        for attempt in range(max_attempts):
+            try:
+                # 1. Create draft reply
+                draft_id = await self.graph_client.create_reply_draft(access_token, parent_message_id)
+                
+                # 2. Update draft body and CC list
+                await self.graph_client.update_message_draft(
+                    access_token=access_token,
+                    draft_id=draft_id,
+                    html_content=final_html_body,
+                    cc_emails=cc_list
+                )
+                
+                # 3. Add attachments if present
+                if graph_attachments:
+                    for attachment in graph_attachments:
+                        attach_url = f"https://graph.microsoft.com/v1.0/me/messages/{draft_id}/attachments"
+                        headers_att = {
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json"
+                        }
+                        async with httpx.AsyncClient(timeout=30.0) as client:
+                            res_att = await client.post(attach_url, headers=headers_att, json=attachment)
+                            if res_att.status_code not in (200, 201):
+                                raise Exception(f"Failed to upload attachment: {res_att.text}")
+                                
+                # 4. Send draft reply
+                await self.graph_client.send_draft(access_token, draft_id)
+                
+                logger.info("Successfully executed Graph reply flow")
+                log_to_request_file("Successfully executed Graph reply flow")
+                return draft_id
+            except Exception as attempt_err:
+                last_err = attempt_err
+                logger.warning(f"Threaded reply attempt {attempt+1} failed: {str(attempt_err)}")
+                log_to_request_file(f"Threaded reply attempt {attempt+1} failed: {str(attempt_err)}")
+                
+                # Cleanup draft if created
+                if draft_id:
+                    try:
+                        await self.graph_client.delete_draft(access_token, draft_id)
+                        log_to_request_file(f"Successfully cleaned up draft: {draft_id}")
+                    except Exception as del_err:
+                        logger.warning("Failed to delete failed draft during cleanup", error=str(del_err))
+                    draft_id = None
+                    
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(2 ** attempt)
+        else:
+            logger.error("All threaded reply attempts failed. Aborting dispatch.")
+            raise last_err
+
     async def send_tenant_email(self, request: EmailRequest) -> EmailResponse:
         import traceback
         import uuid
@@ -311,16 +397,88 @@ class EmailService:
             await self.session.rollback()
             raise e
 
+        # Resolve parent Graph message ID for threaded reply
+        parent_graph_message_id = None
+        is_reply_expected = False
+
+        if request.parent_message_id:
+            parent_graph_message_id = request.parent_message_id
+            is_reply_expected = True
+            log_to_request_file(f"Priority 1: Using parent_message_id directly from request: {parent_graph_message_id}")
+        elif request.references or request.in_reply_to:
+            # Priority 2: Expected to be a reply, parent_message_id missing -> lookup from DB
+            is_reply_expected = True
+            log_to_request_file("Priority 2: Request is expected to be a threaded reply. Attempting DB lookup...")
+            try:
+                res_parent = await self.session.execute(text("""
+                    SELECT graph_message_id 
+                    FROM email_log 
+                    WHERE organization_id = :org_id 
+                      AND direction = 'inbound' 
+                      AND (thread_id = :thread_id OR internet_message_id = :references OR internet_message_id = :in_reply_to)
+                      AND graph_message_id IS NOT NULL
+                    ORDER BY sent_at DESC 
+                    LIMIT 1
+                """), {
+                    "org_id": request.organization_id,
+                    "thread_id": request.thread_id,
+                    "references": request.references,
+                    "in_reply_to": request.in_reply_to
+                })
+                row_parent = res_parent.fetchone()
+                if row_parent:
+                    parent_graph_message_id = row_parent[0]
+                    log_to_request_file(f"Resolved parent Graph message ID from DB lookup: {parent_graph_message_id}")
+                else:
+                    log_to_request_file("DB lookup returned no matching parent inbound email.")
+            except Exception as lookup_ex:
+                logger.warning("Failed to lookup parent Graph message ID in DB", error=str(lookup_ex))
+        else:
+            # Priority 3: Brand-new outbound message -> Go straight to sendMail flow without DB query
+            log_to_request_file("Priority 3: Brand-new outbound message. Proceeding straight to sendMail flow.")
+
+        # Load default CC emails from organization AI settings table
+        cc_list = []
+        try:
+            settings_res = await self.session.execute(text("""
+                SELECT default_cc_emails FROM organization_ai_settings WHERE organization_id = :org_id
+            """), {"org_id": request.organization_id})
+            settings_row = settings_res.fetchone()
+            if settings_row and settings_row[0]:
+                import json
+                cc_list = json.loads(settings_row[0]) if isinstance(settings_row[0], str) else settings_row[0]
+        except Exception as settings_ex:
+            logger.warning("Failed to load default CC emails from AI settings", error=str(settings_ex))
+
         # STEP 6: Send Graph Email
         try:
-            async with StepTracker(6, "Send Graph Email"):
-                message_id = await self.graph_client.send_email(
-                    access_token=access_token,
-                    subject=request.subject,
-                    html_content=final_html_body,
-                    to_email=request.customer_email,
-                    attachments=graph_attachments
-                )
+            if is_reply_expected:
+                if not parent_graph_message_id:
+                    # Do NOT thread unknown replies, raise delivery failure
+                    error_msg = "Threaded reply expected but no valid parent Graph message could be resolved."
+                    log_to_request_file(f"Delivery Failed: {error_msg}")
+                    logger.error(error_msg)
+                    raise EmailSendError(error_msg)
+                    
+                async with StepTracker(6, "Send Graph Threaded Reply"):
+                    message_id = await self._send_threaded_reply(
+                        request=request,
+                        access_token=access_token,
+                        final_html_body=final_html_body,
+                        graph_attachments=graph_attachments,
+                        parent_message_id=parent_graph_message_id,
+                        cc_list=cc_list,
+                        prefix=prefix
+                    )
+            else:
+                async with StepTracker(6, "Send Graph Email"):
+                    message_id = await self._send_new_email(
+                        request=request,
+                        access_token=access_token,
+                        final_html_body=final_html_body,
+                        graph_attachments=graph_attachments,
+                        prefix=prefix
+                    )
             logger.info("GRAPH API SUCCESS")
             log_to_request_file(f"Graph API Success: message_id={message_id}")
         except Exception as e:
@@ -330,8 +488,63 @@ class EmailService:
             traceback.print_exc()
             log_to_request_file(f"Exception in Send Graph Email: {type(e)} - {repr(e)}\nTraceback:\n{tb_str}")
             logger.exception("ORIGINAL ERROR")
+            if parent_graph_message_id:
+                try:
+                    await self.session.execute(
+                        text("""
+                            UPDATE email_log
+                            SET delivery_status = 'delivered'
+                            WHERE organization_id = :org_id
+                              AND direction = 'inbound'
+                              AND graph_message_id = :parent_id
+                              AND delivery_status = 'queued'
+                        """),
+                        {"org_id": request.organization_id, "parent_id": parent_graph_message_id}
+                    )
+                    await self.session.commit()
+                except Exception as revert_ex:
+                    logger.warning("Failed to revert inbound email delivery_status on error", error=str(revert_ex))
             await self.session.rollback()
             raise e
+
+        # Retrieve true message details from Sent Items dynamically
+        true_msg_id = message_id
+        true_conv_id = request.conversation_id or request.thread_id
+        true_thread_id = request.thread_id or request.conversation_id
+        true_internet_id = request.internet_message_id
+        true_index = None
+        
+        try:
+            logger.info("Attempting to retrieve sent message metadata from Sent Items folder")
+            sent_meta = await self.graph_client.get_sent_message_metadata(
+                access_token=access_token,
+                subject=request.subject,
+                to_email=request.customer_email
+            )
+            if sent_meta.get("retrieval_success"):
+                true_msg_id = sent_meta.get("id") or true_msg_id
+                true_conv_id = sent_meta.get("conversation_id") or true_conv_id
+                true_thread_id = sent_meta.get("conversation_id") or true_thread_id
+                true_internet_id = sent_meta.get("internet_message_id") or true_internet_id
+                true_index = sent_meta.get("conversation_index")
+                
+                logger.info(
+                    "Outbound Email Audit - Graph Message Persisted",
+                    conversationId=true_conv_id,
+                    internetMessageId=true_internet_id,
+                    id=true_msg_id,
+                    conversationIndex=true_index,
+                    retrieval_success=True,
+                    retrieval_time_ms=sent_meta.get("retrieval_time_ms")
+                )
+            else:
+                logger.warning(
+                    "Outbound Email Audit - Sent Items retrieval failed or timed out",
+                    retrieval_success=False,
+                    retrieval_time_ms=sent_meta.get("retrieval_time_ms", 0)
+                )
+        except Exception as meta_ex:
+            logger.warning("Failed to query Sent Items metadata", error=str(meta_ex), retrieval_success=False)
 
         # STEP 7: Save Email History
         logger.info("INSERT email_log")
@@ -359,10 +572,10 @@ class EmailService:
                         "subject": request.subject,
                         "body": final_html_body,
                         "has_attachment": has_attachment,
-                        "graph_message_id": message_id,
-                        "conversation_id": request.conversation_id or request.thread_id,
-                        "thread_id": request.thread_id or request.conversation_id,
-                        "internet_message_id": request.internet_message_id,
+                        "graph_message_id": true_msg_id,
+                        "conversation_id": true_conv_id,
+                        "thread_id": true_thread_id,
+                        "internet_message_id": true_internet_id,
                         "references": request.references,
                         "in_reply_to": request.in_reply_to
                     }
@@ -379,6 +592,7 @@ class EmailService:
             logger.exception("FAILED INSERT email_log")
             await self.session.rollback()
             raise e
+
 
         # STEP 8: Commit
         logger.info("COMMIT")
