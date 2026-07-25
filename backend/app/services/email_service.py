@@ -351,18 +351,61 @@ class EmailService:
         # STEP 5: Render HTML and Plain Text
         try:
             async with StepTracker(5, "Render HTML and Plain Text"):
+                # Structured logs: Before Rendering
+                has_sep = "--" in request.html_body
+                has_reg = "best regards" in request.html_body.lower() or "regards" in request.html_body.lower()
+                has_sig = (sig_config.signature_html.lower() in request.html_body.lower()) if sig_config and sig_config.signature_html else False
+                logger.info(
+                    "Stage: Email Payload Builder (Before Rendering)",
+                    reply_id=str(request.parent_message_id or "N/A"),
+                    reply_body_length=len(request.html_body),
+                    contains_separator=has_sep,
+                    contains_best_regards=has_reg,
+                    contains_org_signature=has_sig
+                )
+
                 # Clean body content
                 cleaned_body = branding_service.clean_and_format_body(request.html_body)
                 
                 # Render final HTML including sanitized signature and optional footer banner
                 final_html_body = branding_service.render_html_email(
                     body_content=cleaned_body,
-                    signature_html=sig_config.signature_html,
-                    banner_url=sig_config.footer_image_url
+                    signature_html=sig_config.signature_html if sig_config else None,
+                    banner_url=sig_config.footer_image_url if sig_config else None
                 )
                 
                 # Render plain-text fallback dynamically on-the-fly
                 final_plain_body = branding_service.render_plain_email(final_html_body)
+
+                # Structured logs: After Rendering HTML
+                has_sep_html = "--" in final_html_body
+                has_reg_html = "best regards" in final_html_body.lower() or "regards" in final_html_body.lower()
+                has_sig_html = (sig_config.signature_html.lower() in final_html_body.lower()) if sig_config and sig_config.signature_html else False
+                logger.info(
+                    "Stage: Email Payload Builder (After Rendering HTML)",
+                    reply_id=str(request.parent_message_id or "N/A"),
+                    reply_body_length=len(final_html_body),
+                    contains_separator=has_sep_html,
+                    contains_best_regards=has_reg_html,
+                    contains_org_signature=has_sig_html
+                )
+
+                # Structured logs: After Rendering Plain Text
+                has_sep_plain = "--" in final_plain_body
+                has_reg_plain = "best regards" in final_plain_body.lower() or "regards" in final_plain_body.lower()
+                has_sig_plain = (sig_config.signature_html.lower() in final_plain_body.lower()) if sig_config and sig_config.signature_html else False
+                logger.info(
+                    "Stage: Email Payload Builder (After Rendering Plain Text)",
+                    reply_id=str(request.parent_message_id or "N/A"),
+                    reply_body_length=len(final_plain_body),
+                    contains_separator=has_sep_plain,
+                    contains_best_regards=has_reg_plain,
+                    contains_org_signature=has_sig_plain
+                )
+
+                # Requirement 4: Log final HTML and Plain Text bodies before Graph API call
+                logger.info("FINAL HTML Email Body to be sent", body=final_html_body)
+                logger.info("FINAL Plain Text Email Body to be sent", body=final_plain_body)
 
                 # Structuring Graph API payload variables
                 _payload = {

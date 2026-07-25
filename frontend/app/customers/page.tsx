@@ -18,6 +18,8 @@ import {
   Loader2,
   AlertCircle
 } from 'lucide-react';
+import { Alert } from '../../components/ui/feedback';
+import { ConfirmationModal } from '../../components/ui/confirmation-modal';
 
 interface Customer {
   id: string;
@@ -126,6 +128,24 @@ export default function CustomersPage() {
   });
   const [savingEdit, setSavingEdit] = useState(false);
 
+  // Modal states
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deletingCustomerId, setDeletingCustomerId] = useState<string | null>(null);
+  const [deletingCustomerName, setDeletingCustomerName] = useState<string>('');
+  const [isDeletingLoading, setIsDeletingLoading] = useState(false);
+
+  const [bulkDeleteModalOpen, setBulkDeleteModalOpen] = useState(false);
+  const [isBulkDeletingLoading, setIsBulkDeletingLoading] = useState(false);
+
+  const [alertInfo, setAlertInfo] = useState<{ variant: 'success' | 'danger'; title: string; message: string } | null>(null);
+
+  const showToast = (variant: 'success' | 'danger', title: string, message: string) => {
+    setAlertInfo({ variant, title, message });
+    setTimeout(() => {
+      setAlertInfo(null);
+    }, 4000);
+  };
+
   // Load resources
   const fetchFilters = async () => {
     try {
@@ -208,32 +228,43 @@ export default function CustomersPage() {
   };
 
   // Actions: Delete Single
-  const handleDeleteSingle = async (id: string, name: string) => {
-    if (!confirm(`Are you sure you want to delete "${name}"?`)) return;
+  const confirmDeleteSingle = async () => {
+    if (!deletingCustomerId) return;
     try {
-      await api.delete(`/api/v1/customers/${id}`);
+      setIsDeletingLoading(true);
+      await api.delete(`/api/v1/customers/${deletingCustomerId}`);
+      showToast('success', 'Customer Deleted', `Successfully deleted ${deletingCustomerName}.`);
       fetchCustomers();
       fetchStats();
       fetchFilters();
-      if (selectedCustomer?.id === id) {
+      if (selectedCustomer?.id === deletingCustomerId) {
         setDrawerOpen(false);
       }
     } catch {
-      alert('Failed to delete customer.');
+      showToast('danger', 'Deletion Failed', 'Could not delete the customer record.');
+    } finally {
+      setIsDeletingLoading(false);
+      setDeleteModalOpen(false);
+      setDeletingCustomerId(null);
     }
   };
 
   // Actions: Bulk Delete
-  const handleBulkDelete = async () => {
-    if (!confirm(`Are you sure you want to delete ${selectedIds.length} customers?`)) return;
+  const confirmBulkDelete = async () => {
+    if (selectedIds.length === 0) return;
     try {
+      setIsBulkDeletingLoading(true);
       await api.post('/api/v1/customers/bulk-delete', { ids: selectedIds });
+      showToast('success', 'Customers Deleted', `Successfully deleted ${selectedIds.length} customer records.`);
       setSelectedIds([]);
       fetchCustomers();
       fetchStats();
       fetchFilters();
     } catch {
-      alert('Failed to execute bulk deletion.');
+      showToast('danger', 'Bulk Deletion Failed', 'Could not delete the selected customer records.');
+    } finally {
+      setIsBulkDeletingLoading(false);
+      setBulkDeleteModalOpen(false);
     }
   };
 
@@ -265,7 +296,7 @@ export default function CustomersPage() {
   const handleSaveEdit = async () => {
     if (!selectedCustomer) return;
     if (!editForm.company_name.trim()) {
-      alert('Company Name is required.');
+      showToast('danger', 'Validation Error', 'Company Name is required.');
       return;
     }
     setSavingEdit(true);
@@ -273,10 +304,11 @@ export default function CustomersPage() {
       const res = await api.put(`/api/v1/customers/${selectedCustomer.id}`, editForm);
       setSelectedCustomer(prev => prev ? { ...prev, ...res.data } : null);
       setIsEditing(false);
+      showToast('success', 'Changes Saved', 'Customer details updated successfully.');
       fetchCustomers();
       fetchStats();
     } catch {
-      alert('Failed to save changes.');
+      showToast('danger', 'Save Failed', 'Failed to save modifications.');
     } finally {
       setSavingEdit(false);
     }
@@ -321,6 +353,16 @@ export default function CustomersPage() {
 
   return (
     <AppShell>
+      {alertInfo && (
+        <div className="fixed top-4 right-4 z-[60] w-full max-w-md animate-in fade-in slide-in-from-top-4 duration-200">
+          <Alert 
+            variant={alertInfo.variant} 
+            title={alertInfo.title} 
+            description={alertInfo.message} 
+            onClose={() => setAlertInfo(null)} 
+          />
+        </div>
+      )}
       <div className="p-4 sm:p-6 md:p-8 max-w-7xl mx-auto w-full space-y-6 sm:space-y-8">
         
         {/* Header section */}
@@ -465,11 +507,11 @@ export default function CustomersPage() {
               {selectedIds.length} customer records selected
             </span>
             <button
-              onClick={handleBulkDelete}
+              onClick={() => setBulkDeleteModalOpen(true)}
               className="flex items-center gap-1 bg-red-600 hover:bg-red-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition-all"
             >
               <Trash2 className="w-3.5 h-3.5" />
-              <span>Bulk Delete</span>
+              <span>Delete Selected ({selectedIds.length})</span>
             </button>
           </div>
         )}
@@ -566,7 +608,11 @@ export default function CustomersPage() {
                             </div>
                           </div>
                           <button
-                            onClick={() => handleDeleteSingle(c.id, c.company_name)}
+                            onClick={() => {
+                              setDeletingCustomerId(c.id);
+                              setDeletingCustomerName(c.company_name);
+                              setDeleteModalOpen(true);
+                            }}
                             className="text-slate-400 hover:text-red-500 p-1.5 rounded-lg hover:bg-red-50 transition-all cursor-pointer"
                           >
                             <Trash2 className="w-4 h-4" />
@@ -931,6 +977,29 @@ export default function CustomersPage() {
           </div>
         </div>
       )}
+
+      {/* Destructive Confirmations */}
+      <ConfirmationModal
+        isOpen={deleteModalOpen}
+        onClose={() => setDeleteModalOpen(false)}
+        onConfirm={confirmDeleteSingle}
+        title="Delete Customer"
+        message={`This action cannot be undone. Are you sure you want to delete ${deletingCustomerName}?`}
+        confirmText="Delete Customer"
+        isLoading={isDeletingLoading}
+        variant="destructive"
+      />
+
+      <ConfirmationModal
+        isOpen={bulkDeleteModalOpen}
+        onClose={() => setBulkDeleteModalOpen(false)}
+        onConfirm={confirmBulkDelete}
+        title={`Delete ${selectedIds.length} Customers`}
+        message={`This action cannot be undone. Are you sure you want to delete ${selectedIds.length} selected customer records?`}
+        confirmText={`Delete ${selectedIds.length} Customers`}
+        isLoading={isBulkDeletingLoading}
+        variant="destructive"
+      />
     </AppShell>
   );
 }

@@ -254,6 +254,18 @@ class MicrosoftGraphClient:
             "retrieval_time_ms": elapsed_ms
         }
 
+    async def get_message_html(self, access_token: str, message_id: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {access_token}"
+        }
+        url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.get(url, headers=headers)
+            if res.status_code == 200:
+                body = res.json().get("body", {})
+                return body.get("content", "")
+        return "ERROR_FETCHING"
+
     async def create_reply_draft(self, access_token: str, parent_message_id: str) -> str:
         """
         Creates a draft reply to a specific parent message inside Outlook.
@@ -271,6 +283,11 @@ class MicrosoftGraphClient:
             if res.status_code in (200, 201):
                 draft_id = res.json().get("id")
                 logger.info("Successfully created reply draft", draft_id=draft_id)
+                
+                # Log Stage: Draft HTML immediately after createReply()
+                draft_html = await self.get_message_html(access_token, draft_id)
+                logger.info("Draft HTML immediately after createReply()", html_content=draft_html)
+                
                 return draft_id
             
             logger.error("Failed to create Graph reply draft", status_code=res.status_code, text=res.text)
@@ -302,6 +319,11 @@ class MicrosoftGraphClient:
             res = await client.patch(url, headers=headers, json=payload)
             if res.status_code in (200, 204):
                 logger.info("Successfully updated reply draft content", draft_id=draft_id)
+                
+                # Log Stage: Draft HTML immediately after PATCH
+                draft_html = await self.get_message_html(access_token, draft_id)
+                logger.info("Draft HTML immediately after PATCH", html_content=draft_html)
+                
                 return
                 
             logger.error("Failed to update Graph reply draft", status_code=res.status_code, text=res.text)
@@ -311,6 +333,10 @@ class MicrosoftGraphClient:
         """
         Sends a prepared draft message.
         """
+        # Log Stage: Draft HTML immediately before send
+        draft_html = await self.get_message_html(access_token, draft_id)
+        logger.info("Draft HTML immediately before send", html_content=draft_html)
+
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Length": "0"

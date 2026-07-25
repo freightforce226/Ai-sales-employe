@@ -4,6 +4,8 @@ import React, { useState, useEffect } from 'react';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
+import { Alert } from './ui/feedback';
+import { ConfirmationModal } from './ui/confirmation-modal';
 import { api } from '../lib/api';
 import { 
   User, 
@@ -72,6 +74,15 @@ export function SignatureTab() {
   const [uploadError, setUploadError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [previewViewport, setPreviewViewport] = useState<'desktop' | 'mobile'>('desktop');
+  
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [alertInfo, setAlertInfo] = useState<{ variant: 'success' | 'danger'; title: string; message: string } | null>(null);
+
+  const showToast = (variant: 'success' | 'danger', title: string, message: string) => {
+    setAlertInfo({ variant, title, message });
+    setTimeout(() => setAlertInfo(null), 4000);
+  };
 
   useEffect(() => {
     fetchSignature();
@@ -159,14 +170,9 @@ export function SignatureTab() {
     }
   };
 
-  const handleDelete = async () => {
-    const confirm = window.confirm(
-      "Are you sure you want to delete this email signature?\n\nFuture outbound emails will no longer include a default signature until a new one is configured."
-    );
-    if (!confirm) return;
-
+  const confirmDelete = async () => {
     try {
-      setIsLoading(true);
+      setIsDeleting(true);
       await api.delete('/api/v1/organization/settings/signature');
       setSignature({
         is_configured: false,
@@ -185,11 +191,13 @@ export function SignatureTab() {
         updated_at: undefined,
       });
       setViewMode('form');
+      showToast('success', 'Signature Deleted', 'Successfully deleted the email signature.');
     } catch (err) {
       console.error('Failed to delete signature settings', err);
-      alert('Failed to delete email signature.');
+      showToast('danger', 'Deletion Failed', 'Could not delete signature.');
     } finally {
-      setIsLoading(false);
+      setIsDeleting(false);
+      setDeleteModalOpen(false);
     }
   };
 
@@ -347,7 +355,7 @@ export function SignatureTab() {
                 <Edit className="w-3.5 h-3.5" />
                 <span>Edit Settings</span>
               </Button>
-              <Button variant="danger" size="sm" onClick={handleDelete} className="flex items-center gap-1.5 cursor-pointer">
+              <Button variant="danger" size="sm" onClick={() => setDeleteModalOpen(true)} className="flex items-center gap-1.5 cursor-pointer">
                 <Trash2 className="w-3.5 h-3.5" />
                 <span>Delete</span>
               </Button>
@@ -644,6 +652,28 @@ export function SignatureTab() {
           </div>
         </div>
       </div>
+
+      {alertInfo && (
+        <div className="fixed top-4 right-4 z-[60] w-full max-w-md animate-in fade-in slide-in-from-top-4 duration-200">
+          <Alert 
+            variant={alertInfo.variant} 
+            title={alertInfo.title} 
+            description={alertInfo.message} 
+            onClose={() => setAlertInfo(null)} 
+          />
+        </div>
+      )}
+
+      <ConfirmationModal
+        isOpen={deleteModalOpen}
+        onClose={() => setDeleteModalOpen(false)}
+        onConfirm={confirmDelete}
+        title="Delete Signature"
+        message="Are you sure you want to delete this email signature? Future outbound emails will no longer include a default signature until a new one is configured."
+        confirmText="Delete Signature"
+        isLoading={isDeleting}
+        variant="destructive"
+      />
     </div>
   );
 }

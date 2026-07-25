@@ -148,20 +148,24 @@ class AIReplyService:
         )
         rows = res.fetchall()
 
-        # Limit to the most recent 10 messages to control context window and token usage
-        if len(rows) > 10:
-            rows = rows[-10:]
+        # Find the most recent outbound message (previous assistant reply)
+        prev_outbound = None
+        for row in reversed(rows):
+            direction, sub, body, sent_at = row
+            if direction == "outbound":
+                prev_outbound = row
+                break
 
         subject = "New Inquiry"
         thread_messages = []
 
-        for direction, sub, body, sent_at in rows:
+        if prev_outbound:
+            direction, sub, body, sent_at = prev_outbound
             if sub:
                 subject = sub
             clean_body = self._clean_context_message(body)
             if clean_body:
-                sender = "Customer" if direction == "inbound" else "Our Team"
-                thread_messages.append(f"[{sent_at.isoformat()}] {sender}: {clean_body}")
+                thread_messages.append(f"[{sent_at.isoformat()}] Our Team: {clean_body}")
 
         cleaned_latest = self._clean_context_message(customer_reply_text)
         thread_context_str = "\n".join(thread_messages)
@@ -176,67 +180,30 @@ class AIReplyService:
         """
         Assembles all prompt components matching prompt, tone, signature, and anti-hallucination rules.
         """
-        current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        
         company = ai_settings.company_name or "our logistics firm"
-        tone = ai_settings.reply_tone
-        instructions = ai_settings.ai_writing_instructions or "Keep replies brief, warm, and helpful."
         thread_history = context_dict["thread_context"]
         latest_msg = context_dict["cleaned_latest_email"]
         subject = context_dict["subject"]
 
-        # Prompt with strict context, signature omission, first vs follow-up determination, and hallucination rules
-        prompt = f"""
-You are an experienced freight sales executive representing {company}.
-The current date and time is {current_date}.
-The email thread subject is: "{subject}".
+        prompt = f"""You are an experienced freight forwarding sales executive representing {company}.
+The email subject is: "{subject}".
 
-Here is the conversation history:
----
+Previous conversation context:
 {thread_history}
----
 
-The customer has just sent this email:
----
-{latest_msg}
----
+Customer's latest email:
+"{latest_msg}"
 
-Your task is to write a short, natural acknowledgement reply email to the customer.
+Task: Write a very short, natural reply email to the customer's latest email.
 
-Strict Prompt Rules:
-1. Determine naturally whether this is the customer's first email or a follow-up. Do not make standard follow-up assumptions if it is a new inquiry.
-2. Base the acknowledgement entirely on the actual topic in the conversation history. Do not assume the shipment is about route optimization unless routing is explicitly mentioned.
-3. If the customer discusses pricing, documentation, customs, warehousing, scheduling, booking, or other logistics topics, acknowledge that specific topic naturally.
-4. Sound completely human. NEVER mention AI, prompt variables, or sound like a template.
-5. Invites the customer to share any additional shipment information if needed (e.g. weight, dimensions, origin, destination).
-6. Crucial: NEVER negotiate pricing, NEVER promise shipment dates, NEVER confirm bookings, and NEVER make any business commitments.
-7. Anti-hallucination rule: If the required details are unavailable, do not guess, do not invent, and do not promise anything. Acknowledge and state that our team is currently reviewing.
-8. Signature constraint: Do NOT generate any closing block or signature components. You must NEVER generate words like 'Regards', 'Best Regards', 'Kind Regards', 'Thanks & Regards', 'Sincerely', a sender name, designation, phone number, email address, or company website signature. Return only the narrative body text.
-9. Tone requirement: {tone}.
-10. Mention shipment optimization ONLY when it is naturally relevant. Do not force this sentence into every reply. If the customer's reply does not require discussing logistics, simply acknowledge naturally.
-
-IMPORTANT:
-- Return ONLY the email reply body.
-- Do NOT generate:
-  - Best Regards
-  - Regards
-  - Thanks & Regards
-  - Sincerely
-  - Signature
-  - Name
-  - Job title
-  - Company name
-  - Phone number
-  - Email address
-  - Banner
-  - Footer
-  - Separator lines (---, ___, etc.)
-
-AI Writing Instructions:
-{instructions}
-
-Reply Body text only (do NOT include subject, signatures, or placeholders):
-"""
+Rules:
+1. Persona: Experienced freight forwarding sales executive. Sound human, natural, and professional.
+2. Preferred length: 20-50 words. Hard maximum: 60 words. Maximum: 3 short paragraphs. Use simple business English.
+3. Reply ONLY to the customer's latest message.
+4. Never explain logistics unless asked. Never oversell. Never repeat customer information.
+5. If the customer only acknowledges, reply with a brief acknowledgement.
+6. Do NOT generate any greeting (like Hi, Hello), closing phrase (Regards, Best Regards, Kind Regards, Sincerely), signature, company name, phone, designation, or separator (--).
+7. Return ONLY the narrative body of the reply."""
         return prompt
 
     async def generate_reply_draft(self, org_id: UUID, customer_id: UUID, thread_id: str, customer_reply_text: str) -> AIReplyGenerateResponse:
@@ -247,6 +214,19 @@ Reply Body text only (do NOT include subject, signatures, or placeholders):
         
         # 1. Fetch AI Settings
         ai_settings = await self.get_settings(org_id)
+
+        # Resolve customer first name for greeting strategy
+        res_cust = await self.db.execute(
+            text("SELECT contact_name FROM customers WHERE id = :customer_id"),
+            {"customer_id": customer_id}
+        )
+        row_cust = res_cust.fetchone()
+        customer_name = row_cust[0] if row_cust else None
+        
+        first_name = None
+        if customer_name:
+            first_name = customer_name.strip().split()[0]
+        greeting = f"Hi {first_name}," if first_name else "Hi,"
         
         # 2. Extract thread context
         context_dict = await self.build_thread_context(org_id, customer_id, thread_id, customer_reply_text)
@@ -257,36 +237,122 @@ Reply Body text only (do NOT include subject, signatures, or placeholders):
         # 4. Generate reply text
         draft_body = ""
         if ai_settings.ai_enabled:
-            draft_body = await self.llm.generate_text(prompt, org_id=str(org_id), thread_id=thread_id)
-            logger.info("Raw Gemini response before sanitization (attempt 1)", raw_body=draft_body)
-            draft_body = self.sanitize_llm_reply(draft_body)
-            logger.info("Sanitized response after sanitize_llm_reply (attempt 1)", sanitized_body=draft_body)
-
-            # Check if sanitized body is empty or too short (< 10 non-whitespace chars)
-            non_ws_count = len([c for c in draft_body if not c.isspace()])
-            if non_ws_count < 10:
-                logger.warning("Sanitized draft body is too short (attempt 1), retrying LLM generation once...", non_ws_count=non_ws_count)
-                draft_body = await self.llm.generate_text(prompt, org_id=str(org_id), thread_id=thread_id)
-                logger.info("Raw Gemini response before sanitization (attempt 2)", raw_body=draft_body)
-                draft_body = self.sanitize_llm_reply(draft_body)
-                logger.info("Sanitized response after sanitize_llm_reply (attempt 2)", sanitized_body=draft_body)
-                
-                if len([c for c in draft_body if not c.isspace()]) < 10:
-                    logger.warning("Sanitized draft body is still too short after retry. Using fallback acknowledgement.")
-                    draft_body = self.llm._get_fallback_reply()
-        else:
-            draft_body = self.llm._get_fallback_reply()
-            logger.info("Raw fallback response", raw_body=draft_body)
-            draft_body = self.sanitize_llm_reply(draft_body)
-            logger.info("Sanitized fallback response", sanitized_body=draft_body)
+            raw_llm = await self.llm.generate_text(prompt, org_id=str(org_id), thread_id=thread_id)
+            sanitized = self.sanitize_llm_reply(raw_llm)
+            draft_body = f"{greeting}\n\n{sanitized}"
             
-        # Append email signature if configured
-        if ai_settings.email_signature:
-            draft_body = f"{draft_body}\n\n--\n{ai_settings.email_signature}"
+            # Log Stage 1: LLM Output (Raw)
+            has_sep = "--" in raw_llm
+            has_reg = "best regards" in raw_llm.lower() or "regards" in raw_llm.lower()
+            has_sig = (ai_settings.email_signature.lower() in raw_llm.lower()) if ai_settings.email_signature else False
+            logger.info(
+                "Stage: LLM Output",
+                reply_id=str(thread_id),
+                reply_body_length=len(raw_llm),
+                contains_separator=has_sep,
+                contains_best_regards=has_reg,
+                contains_org_signature=has_sig,
+                raw_body=raw_llm
+            )
+            
+            # Log Stage 2: sanitize_llm_reply Output
+            has_sep = "--" in draft_body
+            has_reg = "best regards" in draft_body.lower() or "regards" in draft_body.lower()
+            has_sig = (ai_settings.email_signature.lower() in draft_body.lower()) if ai_settings.email_signature else False
+            logger.info(
+                "Stage: sanitize_llm_reply completed",
+                reply_id=str(thread_id),
+                reply_body_length=len(draft_body),
+                contains_separator=has_sep,
+                contains_best_regards=has_reg,
+                contains_org_signature=has_sig,
+                sanitized_body=draft_body
+            )
+
+            # Validation
+            word_count = len(draft_body.split())
+            non_ws_count = len([c for c in sanitized if not c.isspace()])
+            
+            if non_ws_count < 10 or self._is_signature_present(draft_body, ai_settings.email_signature) or word_count > 60:
+                logger.warning(f"Draft invalid (words: {word_count}, non-ws: {non_ws_count}), retrying LLM generation once...")
+                raw_llm = await self.llm.generate_text(prompt, org_id=str(org_id), thread_id=thread_id)
+                sanitized = self.sanitize_llm_reply(raw_llm)
+                draft_body = f"{greeting}\n\n{sanitized}"
+                
+                # Log Stage 1: LLM Output Retry (Raw)
+                has_sep = "--" in raw_llm
+                has_reg = "best regards" in raw_llm.lower() or "regards" in raw_llm.lower()
+                has_sig = (ai_settings.email_signature.lower() in raw_llm.lower()) if ai_settings.email_signature else False
+                logger.info(
+                    "Stage: LLM Output (Retry Attempt)",
+                    reply_id=str(thread_id),
+                    reply_body_length=len(raw_llm),
+                    contains_separator=has_sep,
+                    contains_best_regards=has_reg,
+                    contains_org_signature=has_sig,
+                    raw_body=raw_llm
+                )
+                
+                # Log Stage 2: sanitize_llm_reply Retry Output
+                has_sep = "--" in draft_body
+                has_reg = "best regards" in draft_body.lower() or "regards" in draft_body.lower()
+                has_sig = (ai_settings.email_signature.lower() in draft_body.lower()) if ai_settings.email_signature else False
+                logger.info(
+                    "Stage: sanitize_llm_reply completed (Retry Attempt)",
+                    reply_id=str(thread_id),
+                    reply_body_length=len(draft_body),
+                    contains_separator=has_sep,
+                    contains_best_regards=has_reg,
+                    contains_org_signature=has_sig,
+                    sanitized_body=draft_body
+                )
+                
+                # Check again
+                word_count = len(draft_body.split())
+                non_ws_count = len([c for c in sanitized if not c.isspace()])
+                if non_ws_count < 10 or self._is_signature_present(draft_body, ai_settings.email_signature) or word_count > 60:
+                    logger.warning("Sanitized draft body is still invalid after retry. Using fallback acknowledgement.")
+                    fallback = self.llm._get_fallback_reply()
+                    sanitized = self.sanitize_llm_reply(fallback)
+                    draft_body = f"{greeting}\n\n{sanitized}"
+        else:
+            fallback = self.llm._get_fallback_reply()
+            sanitized = self.sanitize_llm_reply(fallback)
+            draft_body = f"{greeting}\n\n{sanitized}"
+            
+            has_sep = "--" in fallback
+            has_reg = "best regards" in fallback.lower() or "regards" in fallback.lower()
+            has_sig = (ai_settings.email_signature.lower() in fallback.lower()) if ai_settings.email_signature else False
+            logger.info(
+                "Stage: LLM Fallback Output",
+                reply_id=str(thread_id),
+                reply_body_length=len(fallback),
+                contains_separator=has_sep,
+                contains_best_regards=has_reg,
+                contains_org_signature=has_sig,
+                raw_body=fallback
+            )
+            
+            has_sep = "--" in draft_body
+            has_reg = "best regards" in draft_body.lower() or "regards" in draft_body.lower()
+            has_sig = (ai_settings.email_signature.lower() in draft_body.lower()) if ai_settings.email_signature else False
+            logger.info(
+                "Stage: sanitize_llm_reply completed (Fallback)",
+                reply_id=str(thread_id),
+                reply_body_length=len(draft_body),
+                contains_separator=has_sep,
+                contains_best_regards=has_reg,
+                contains_org_signature=has_sig,
+                sanitized_body=draft_body
+            )
+            
+        # 5. Strict assertion before response serialization
+        if self._is_signature_present(draft_body, ai_settings.email_signature):
+            logger.error("Strict Assertion failed: reply_body contains signature components after sanitization", body=draft_body)
+            raise ValueError("Sanitization failed: reply_body still contains signature or signature components.")
             
         # Parse suggested CC emails
         cc_emails = ai_settings.default_cc_emails if isinstance(ai_settings.default_cc_emails, list) else []
-
         
         return AIReplyGenerateResponse(
             subject=f"Re: {context_dict['subject']}" if not context_dict['subject'].lower().startswith("re:") else context_dict['subject'],
@@ -422,30 +488,80 @@ Reply Body text only (do NOT include subject, signatures, or placeholders):
         """
         Marks the AI reply as completed, updates status, and persists details.
         """
-        # 1. Update email log status and timestamps
-        await self.db.execute(
-            text("""
-                UPDATE email_log
-                SET delivery_status = 'sent',
-                    sent_at = COALESCE(:sent_at, sent_at),
-                    queued_at = NULL
-                WHERE graph_message_id = :message_id
-            """),
-            {
-                "message_id": payload.message_id,
-                "sent_at": datetime.fromisoformat(payload.sent_at.replace("Z", "+00:00")) if payload.sent_at else None
-            }
-        )
+        import time
+        start_time = time.perf_counter()
         
-        # 2. Find details from the outbound email log if not passed
+        reply_id = payload.reply_id
+        graph_message_id = payload.graph_message_id
+        sent_at = payload.sent_at
+
+        # 1. Fetch details by reply_id
         res = await self.db.execute(
-            text("SELECT organization_id, customer_id, thread_id, in_reply_to FROM email_log WHERE graph_message_id = :message_id"),
-            {"message_id": payload.message_id}
+            text("""
+                SELECT id, organization_id, customer_id, thread_id, in_reply_to, delivery_status, graph_message_id, sent_at 
+                FROM email_log 
+                WHERE id = :reply_id
+            """),
+            {"reply_id": reply_id}
         )
         row = res.fetchone()
-        if row:
-            org_id, customer_id, thread_id, in_reply_to = row
-            # Update the parent inbound email's status to 'sent' (completed)
+        if not row:
+            logger.error("complete_reply - reply not found", reply_id=str(reply_id))
+            raise ValueError("reply_not_found")
+            
+        (
+            db_id, org_id, customer_id, thread_id, in_reply_to, 
+            curr_delivery_status, curr_graph_message_id, curr_sent_at
+        ) = row
+
+        # Log before update
+        logger.info(
+            "AI Reply Complete Request Received",
+            reply_id=str(reply_id),
+            delivery_status=curr_delivery_status,
+            graph_message_id=curr_graph_message_id,
+            sent_at=curr_sent_at.isoformat() if curr_sent_at else None
+        )
+
+        # Idempotency check
+        if curr_delivery_status == "sent":
+            elapsed = int((time.perf_counter() - start_time) * 1000)
+            logger.info(
+                "AI Reply Complete Idempotent Skip",
+                reply_id=str(reply_id),
+                graph_message_id=curr_graph_message_id,
+                execution_time_ms=elapsed,
+                followups_completed=0,
+                status="sent"
+            )
+            return {
+                "success": True,
+                "reply_id": db_id,
+                "graph_message_id": curr_graph_message_id,
+                "sent_at": curr_sent_at,
+                "delivery_status": "sent"
+            }
+
+        followups_completed = 0
+        try:
+            # 2. Update outbound email log status
+            await self.db.execute(
+                text("""
+                    UPDATE email_log
+                    SET delivery_status = 'sent',
+                        graph_message_id = :graph_message_id,
+                        sent_at = :sent_at,
+                        queued_at = NULL
+                    WHERE id = :reply_id
+                """),
+                {
+                    "reply_id": reply_id,
+                    "graph_message_id": graph_message_id,
+                    "sent_at": sent_at
+                }
+            )
+
+            # 3. Update the parent inbound email's status to 'sent'
             await self.db.execute(
                 text("""
                     UPDATE email_log
@@ -462,12 +578,13 @@ Reply Body text only (do NOT include subject, signatures, or placeholders):
                     "in_reply_to": in_reply_to
                 }
             )
-            # Update follow_up_schedule status if there is a matching schedule
-            await self.db.execute(
+
+            # 4. Update follow_up_schedule status if there is a matching schedule
+            res_followup = await self.db.execute(
                 text("""
                     UPDATE follow_up_schedule
                     SET status = 'completed',
-                        completed_at = NOW(),
+                        completed_at = :sent_at,
                         updated_at = NOW()
                     WHERE organization_id = :org_id
                       AND customer_id = :customer_id
@@ -478,12 +595,37 @@ Reply Body text only (do NOT include subject, signatures, or placeholders):
                     "org_id": org_id,
                     "customer_id": customer_id,
                     "thread_id": thread_id,
-                    "in_reply_to": in_reply_to
+                    "in_reply_to": in_reply_to,
+                    "sent_at": sent_at
                 }
             )
-            
-        await self.db.commit()
-        return {"success": True, "message_id": payload.message_id}
+            followups_completed = res_followup.rowcount
+
+            # Commit only after all updates succeed
+            await self.db.commit()
+
+        except Exception as e:
+            logger.exception("AI Reply Complete Failed - rolling back transaction", reply_id=str(reply_id))
+            await self.db.rollback()
+            raise e
+
+        elapsed = int((time.perf_counter() - start_time) * 1000)
+        logger.info(
+            "AI Reply Complete Success",
+            reply_id=str(reply_id),
+            graph_message_id=graph_message_id,
+            execution_time_ms=elapsed,
+            followups_completed=followups_completed,
+            status="sent"
+        )
+
+        return {
+            "success": True,
+            "reply_id": reply_id,
+            "graph_message_id": graph_message_id,
+            "sent_at": sent_at,
+            "delivery_status": "sent"
+        }
 
     async def lock_reply(self, payload: AIReplyLockRequest) -> dict:
         """
@@ -844,4 +986,250 @@ Reply Body text only (do NOT include subject, signatures, or placeholders):
         
         logger.info(f"Recovery scan completed. Recovered {res_update.rowcount} stale locks.")
         return res_update.rowcount
+
+    def _is_signature_present(self, text_body: str, sig_config: str | None) -> bool:
+        if not text_body:
+            return False
+        text_lower = text_body.lower()
+        forbidden_terms = [
+            "--", "best regards", "regards", "thanks & regards",
+            "phone", "mobile", "email"
+        ]
+        if sig_config:
+            forbidden_terms.append(sig_config.lower())
+        for term in forbidden_terms:
+            if term in text_lower:
+                return True
+        return False
+
+    async def get_operations_dashboard(self, org_id: UUID) -> dict:
+        # 1. Waiting for Reply (direction = inbound, status = delivered, and NOT replied to)
+        res_waiting = await self.db.execute(
+            text("""
+                SELECT COUNT(DISTINCT el.thread_id) 
+                FROM email_log el
+                WHERE el.organization_id = :org_id 
+                  AND el.direction = 'inbound' 
+                  AND el.delivery_status = 'delivered'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM email_log outbound 
+                      WHERE outbound.organization_id = el.organization_id 
+                        AND outbound.direction = 'outbound' 
+                        AND (outbound.thread_id = el.thread_id OR outbound.in_reply_to = el.internet_message_id)
+                  )
+            """),
+            {"org_id": org_id}
+        )
+        waiting_count = res_waiting.scalar() or 0
+
+        # 2. AI Preparing Reply (direction = inbound, status = queued)
+        res_preparing = await self.db.execute(
+            text("""
+                SELECT COUNT(DISTINCT el.thread_id) 
+                FROM email_log el
+                WHERE el.organization_id = :org_id 
+                  AND el.direction = 'inbound' 
+                  AND el.delivery_status = 'queued'
+            """),
+            {"org_id": org_id}
+        )
+        preparing_count = res_preparing.scalar() or 0
+
+        # 3. Replies Sent Today (direction = outbound, status = sent, sent today)
+        res_sent = await self.db.execute(
+            text("""
+                SELECT COUNT(DISTINCT thread_id) 
+                FROM email_log 
+                WHERE organization_id = :org_id 
+                  AND direction = 'outbound' 
+                  AND delivery_status = 'sent' 
+                  AND DATE(sent_at) = CURRENT_DATE
+            """),
+            {"org_id": org_id}
+        )
+        sent_count = res_sent.scalar() or 0
+
+        # 4. Needs Attention (direction = inbound or outbound, status = failed)
+        res_failed = await self.db.execute(
+            text("""
+                SELECT COUNT(DISTINCT thread_id) 
+                FROM email_log 
+                WHERE organization_id = :org_id 
+                  AND delivery_status = 'failed'
+            """),
+            {"org_id": org_id}
+        )
+        failed_count = res_failed.scalar() or 0
+
+        return {
+            "waiting_for_reply": waiting_count,
+            "ai_preparing_reply": preparing_count,
+            "replies_sent_today": sent_count,
+            "needs_attention": failed_count
+        }
+
+    async def get_operations_list(self, org_id: UUID, search: str | None = None, status: str | None = None) -> list:
+        # Wrap the DISTINCT ON subquery so we can order by received_at DESC globally
+        query_str = """
+            SELECT * FROM (
+                SELECT DISTINCT ON (el.thread_id) el.id AS reply_id, el.delivery_status, c.contact_name AS customer_name, 
+                       c.company_name, el.subject, el.sent_at AS received_at, el.thread_id, el.graph_message_id,
+                       (SELECT sent_at FROM email_log outbound 
+                        WHERE outbound.organization_id = el.organization_id 
+                          AND outbound.direction = 'outbound' 
+                          AND (outbound.thread_id = el.thread_id OR outbound.in_reply_to = el.internet_message_id) 
+                        ORDER BY outbound.sent_at DESC LIMIT 1) AS reply_time
+                FROM email_log el
+                JOIN customers c ON el.customer_id = c.id
+                WHERE el.organization_id = :org_id
+                  AND el.direction = 'inbound'
+        """
+        params = {"org_id": org_id}
+
+        if status:
+            if status == "Waiting for Reply":
+                query_str += """ AND el.delivery_status = 'delivered'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM email_log outbound 
+                      WHERE outbound.organization_id = el.organization_id 
+                        AND outbound.direction = 'outbound' 
+                        AND (outbound.thread_id = el.thread_id OR outbound.in_reply_to = el.internet_message_id)
+                  )"""
+            elif status == "AI Preparing Reply":
+                query_str += " AND el.delivery_status = 'queued'"
+            elif status == "Reply Sent":
+                query_str += " AND el.delivery_status = 'sent'"
+            elif status == "Needs Attention":
+                query_str += " AND el.delivery_status = 'failed'"
+
+        if search:
+            query_str += " AND (c.contact_name ILIKE :search OR c.company_name ILIKE :search OR el.subject ILIKE :search)"
+            params["search"] = f"%{search}%"
+
+        query_str += """
+                ORDER BY el.thread_id, el.sent_at DESC
+            ) sub
+            ORDER BY sub.received_at DESC
+        """
+
+        res = await self.db.execute(text(query_str), params)
+        rows = res.fetchall()
+
+        items = []
+        for r in rows:
+            items.append({
+                "reply_id": r.reply_id,
+                "delivery_status": r.delivery_status,
+                "customer_name": r.customer_name,
+                "company_name": r.company_name,
+                "subject": r.subject,
+                "received_at": r.received_at,
+                "thread_id": r.thread_id,
+                "graph_message_id": r.graph_message_id,
+                "reply_time": r.reply_time
+            })
+        return items
+
+    async def get_operations_detail(self, org_id: UUID, reply_id: UUID) -> dict:
+        import re
+        def clean_html(raw_html: str) -> str:
+            if not raw_html:
+                return ""
+            text = re.sub(r'<style[^>]*>.*?</style>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+            text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
+            text = re.sub(r'</div>', '\n', text, flags=re.IGNORECASE)
+            text = re.sub(r'<tr[^>]*>', '\n', text, flags=re.IGNORECASE)
+            text = re.sub(r'</td>', '\t', text, flags=re.IGNORECASE)
+            text = re.sub(r'<[^>]+>', ' ', text)
+            text = text.replace('&nbsp;', ' ').replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&').replace('&quot;', '"').replace('&#39;', "'")
+            
+            cleaned_lines = []
+            for line in text.split('\n'):
+                s_line = line.strip()
+                if s_line:
+                    s_line = re.sub(r'[ \t]+', ' ', s_line)
+                    cleaned_lines.append(s_line)
+                else:
+                    if cleaned_lines and cleaned_lines[-1] != "":
+                        cleaned_lines.append("")
+            return '\n'.join(cleaned_lines).strip()
+
+        res = await self.db.execute(
+            text("""
+                SELECT el.id, el.subject, el.body, el.sent_at AS received_at, el.queued_at, el.delivery_status, el.thread_id, el.internet_message_id,
+                       c.contact_name AS customer_name, c.company_name, c.contact_email, settings.default_cc_emails
+                FROM email_log el
+                JOIN customers c ON el.customer_id = c.id
+                JOIN organization_ai_settings settings ON el.organization_id = settings.organization_id
+                WHERE el.id = :reply_id AND el.organization_id = :org_id
+            """),
+            {"reply_id": reply_id, "org_id": org_id}
+        )
+        row = res.fetchone()
+        if not row:
+            raise ValueError("reply_not_found")
+
+        (
+            db_id, subject, original_body, received_at, queued_at, delivery_status, thread_id, internet_message_id,
+            customer_name, company_name, customer_email, default_cc
+        ) = row
+
+        clean_customer_msg = clean_html(original_body)
+
+        res_out = await self.db.execute(
+            text("""
+                SELECT body, sent_at FROM email_log 
+                WHERE organization_id = :org_id 
+                  AND direction = 'outbound' 
+                  AND (thread_id = :thread_id OR in_reply_to = :internet_message_id)
+                ORDER BY sent_at DESC LIMIT 1
+            """),
+            {"org_id": org_id, "thread_id": thread_id, "internet_message_id": internet_message_id}
+        )
+        row_out = res_out.fetchone()
+        final_sent_html = row_out[0] if row_out else None
+        sent_at = row_out[1] if row_out else None
+
+        clean_final_sent = clean_html(final_sent_html) if final_sent_html else None
+
+        cc_list = []
+        if default_cc:
+            if isinstance(default_cc, str):
+                try:
+                    import json
+                    cc_list = json.loads(default_cc)
+                except Exception:
+                    cc_list = []
+            elif isinstance(default_cc, list):
+                cc_list = default_cc
+
+        recipients = {
+            "to": [customer_email],
+            "cc": cc_list,
+            "bcc": []
+        }
+
+        timeline = []
+        if received_at:
+            timeline.append({"stage": "Customer Email Received", "timestamp": received_at})
+        if queued_at:
+            timeline.append({"stage": "AI Reply Prepared", "timestamp": queued_at})
+        if delivery_status == 'sent' and sent_at:
+            timeline.append({"stage": "Reply Sent Successfully", "timestamp": sent_at})
+
+        return {
+            "reply_id": db_id,
+            "customer_name": customer_name,
+            "company_name": company_name,
+            "customer_email": customer_email,
+            "subject": subject,
+            "received_at": received_at,
+            "original_body": clean_customer_msg,
+            "final_sent": clean_final_sent,
+            "final_sent_html": final_sent_html,
+            "recipients": recipients,
+            "timeline": timeline
+        }
 

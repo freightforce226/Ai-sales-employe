@@ -48,10 +48,11 @@ async def lifespan(app: FastAPI):
     )
     
     # Initialize DB schemas/tables if missing
-    from app.db.migrations import run_engagement_migrations, run_ai_reply_migrations
+    from app.db.migrations import run_engagement_migrations, run_ai_reply_migrations, run_organization_settings_migrations
     try:
         await run_engagement_migrations()
         await run_ai_reply_migrations()
+        await run_organization_settings_migrations()
         from sqlalchemy import text
         from app.db.session import AsyncSessionLocal
         async with AsyncSessionLocal() as session:
@@ -330,6 +331,7 @@ async def email_send_error_exception_handler(request: Request, exc: Exception):
 # Register routes
 from app.api.routes import organization
 from app.api.routes import signature
+from app.api.routes import settings as org_settings
 app.include_router(oauth.router, prefix="/api/v1/oauth")
 app.include_router(auth.router)
 app.include_router(email.router)
@@ -344,6 +346,7 @@ app.include_router(signature.router)
 app.include_router(follow_ups.router, prefix="/api/v1/follow-ups")
 app.include_router(follow_ups.router, prefix="/api/v1/followups")
 app.include_router(ai_reply.router)
+app.include_router(org_settings.router)
 
 
 @app.get("/health", tags=["Health"])

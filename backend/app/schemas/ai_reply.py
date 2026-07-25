@@ -26,7 +26,7 @@ Responsibilities:
 from typing import List, Optional
 from uuid import UUID
 from datetime import datetime
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 class AIReplySettingsResponse(BaseModel):
     organization_id: UUID
@@ -92,16 +92,24 @@ class AIReplyPendingResponse(BaseModel):
     }
 
 class AIReplyCompleteRequest(BaseModel):
-    message_id: str
-    sent_at: Optional[str] = None
-    thread_id: Optional[str] = None
-    organization_id: Optional[UUID] = None
-    customer_id: Optional[UUID] = None
+    reply_id: UUID
+    graph_message_id: str
+    sent_at: datetime
+
+    @field_validator("graph_message_id")
+    @classmethod
+    def validate_graph_message_id(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("invalid_graph_message_id")
+        return v
 
 
 class AIReplyCompleteResponse(BaseModel):
     success: bool
-    message_id: str
+    reply_id: UUID
+    graph_message_id: str
+    sent_at: datetime
+    delivery_status: str
 
 
 class AIReplyLockRequest(BaseModel):

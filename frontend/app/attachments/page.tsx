@@ -6,8 +6,9 @@ import { AppShell } from '../../components/layout/shell';
 import { PageWrapper, PageHeader } from '../../components/layout/page-wrapper';
 import { Card, MetricCard } from '../../components/ui/card';
 import { Button } from '../../components/ui/button';
-import { Badge } from '../../components/ui/feedback';
+import { Badge, Alert } from '../../components/ui/feedback';
 import { Input, Select } from '../../components/ui/input';
+import { ConfirmationModal } from '../../components/ui/confirmation-modal';
 import {
   FileText,
   Plus,
@@ -95,6 +96,17 @@ export default function AttachmentsPage() {
 
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [actionLoading, setActionLoading] = useState(false);
+
+  // Modal states
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deletingAttachment, setDeletingAttachment] = useState<Attachment | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [alertInfo, setAlertInfo] = useState<{ variant: 'success' | 'danger'; title: string; message: string } | null>(null);
+
+  const showToast = (variant: 'success' | 'danger', title: string, message: string) => {
+    setAlertInfo({ variant, title, message });
+    setTimeout(() => setAlertInfo(null), 4000);
+  };
 
   // Stats calculation
   const [stats, setStats] = useState({
@@ -347,14 +359,20 @@ export default function AttachmentsPage() {
     }
   };
 
-  const handleDelete = async (att: Attachment) => {
-    if (!confirm(`Are you sure you want to permanently delete "${att.attachment_name}"?`)) return;
+  const confirmDelete = async () => {
+    if (!deletingAttachment) return;
     try {
-      await api.delete(`/api/v1/attachments/${att.id}`);
+      setIsDeleting(true);
+      await api.delete(`/api/v1/attachments/${deletingAttachment.id}`);
+      showToast('success', 'Attachment Deleted', `Successfully deleted "${deletingAttachment.attachment_name}".`);
       fetchAttachments();
     } catch (err) {
       console.error(err);
-      alert("Failed to delete attachment.");
+      showToast('danger', 'Deletion Failed', 'Failed to delete attachment.');
+    } finally {
+      setIsDeleting(false);
+      setDeleteModalOpen(false);
+      setDeletingAttachment(null);
     }
   };
 
@@ -385,6 +403,16 @@ export default function AttachmentsPage() {
   return (
     <AppShell>
       <PageWrapper>
+        {alertInfo && (
+          <div className="fixed top-4 right-4 z-[60] w-full max-w-md animate-in fade-in slide-in-from-top-4 duration-200">
+            <Alert 
+              variant={alertInfo.variant} 
+              title={alertInfo.title} 
+              description={alertInfo.message} 
+              onClose={() => setAlertInfo(null)} 
+            />
+          </div>
+        )}
         <PageHeader
           title="Email Attachments"
           description="Manage campaign attachments sent automatically with outreach emails"
@@ -522,14 +550,17 @@ export default function AttachmentsPage() {
                           >
                             <RefreshCw className="w-3.5 h-3.5" />
                           </Button>
-                          <Button
-                            variant="secondary"
-                            onClick={() => handleDelete(att)}
-                            className="p-1.5 h-auto text-text-secondary hover:text-status-danger"
-                            title="Delete Attachment"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </Button>
+                           <Button
+                             variant="secondary"
+                             onClick={() => {
+                               setDeletingAttachment(att);
+                               setDeleteModalOpen(true);
+                             }}
+                             className="p-1.5 h-auto text-text-secondary hover:text-status-danger"
+                             title="Delete Attachment"
+                           >
+                             <Trash2 className="w-3.5 h-3.5" />
+                           </Button>
                         </td>
                       </tr>
                     ))
@@ -901,6 +932,16 @@ export default function AttachmentsPage() {
           </div>
         )}
 
+        <ConfirmationModal
+          isOpen={deleteModalOpen}
+          onClose={() => setDeleteModalOpen(false)}
+          onConfirm={confirmDelete}
+          title="Delete Attachment"
+          message={`Are you sure you want to permanently delete "${deletingAttachment?.attachment_name}"? This action cannot be undone.`}
+          confirmText="Delete Attachment"
+          isLoading={isDeleting}
+          variant="destructive"
+        />
       </PageWrapper>
     </AppShell>
   );

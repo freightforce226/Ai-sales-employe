@@ -127,6 +127,10 @@ class EmailBrandingService:
         """
         Renders a responsive, Outlook and Gmail compatible HTML email using only inline styles.
         """
+        import traceback
+        stack = "".join(traceback.format_list(traceback.extract_stack()))
+        logger.info("ENTER render_html_email()", call_stack=stack)
+        
         # Convert plain paragraphs in body to clean HTML paragraph tags if they aren't already HTML
         formatted_body = ""
         body_content = body_content.strip()
@@ -223,6 +227,7 @@ class EmailBrandingService:
         html_template = re.sub(r'[\r\n\t]+', ' ', html_template)
         html_template = re.sub(r'\s{2,}', ' ', html_template)
         html_template = html_template.replace("<p></p>", "").replace("<p style=\"margin-top:0;margin-bottom:16px;font-family:Segoe UI,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.6;color:#333333;\"></p>", "")
+        logger.info("EXIT render_html_email()")
         return html_template.strip()
 
     def render_plain_email(self, html_content: str) -> str:

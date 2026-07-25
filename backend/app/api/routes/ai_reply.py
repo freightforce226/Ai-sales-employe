@@ -25,7 +25,7 @@ Responsibilities:
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy import text
 from app.db.session import get_db_session
@@ -143,7 +143,20 @@ async def complete_reply(
         res = await service.complete_reply(payload)
         return AIReplyCompleteResponse(
             success=res["success"],
-            message_id=res["message_id"]
+            reply_id=res["reply_id"],
+            graph_message_id=res["graph_message_id"],
+            sent_at=res["sent_at"],
+            delivery_status=res["delivery_status"]
+        )
+    except ValueError as ve:
+        if str(ve) == "reply_not_found":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="reply_not_found"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve)
         )
     except Exception as e:
         logger.error("Failed to complete AI reply", error=str(e))
@@ -198,6 +211,71 @@ async def fail_reply(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to release lock on failure: {str(e)}"
+        )
+
+
+@router.get("/dashboard")
+async def get_operations_dashboard(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session)
+):
+    service = AIReplyService(db)
+    try:
+        return await service.get_operations_dashboard(current_user.organization_id)
+    except Exception as e:
+        logger.error("Failed to fetch operations dashboard KPIs", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@router.get("/list")
+async def get_operations_list(
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session)
+):
+    service = AIReplyService(db)
+    try:
+        return await service.get_operations_list(
+            org_id=current_user.organization_id,
+            search=search,
+            status=status
+        )
+    except Exception as e:
+        logger.error("Failed to fetch operations list", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@router.get("/{reply_id}")
+async def get_operations_detail(
+    reply_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session)
+):
+    service = AIReplyService(db)
+    try:
+        return await service.get_operations_detail(current_user.organization_id, reply_id)
+    except ValueError as ve:
+        if str(ve) == "reply_not_found":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="reply_not_found"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve)
+        )
+    except Exception as e:
+        logger.error("Failed to fetch operations detail", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
 
 

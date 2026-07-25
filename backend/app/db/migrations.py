@@ -182,8 +182,74 @@ async def run_ai_reply_migrations():
             logger.error("Failed executing or verifying AI Reply lock recovery migrations", error=str(e))
 
 
+async def run_organization_settings_migrations():
+    """
+    Executes database migrations to create and seed organization_settings table and organization profile columns.
+    """
+    logger.info("Starting database schema migrations for Organization Settings...")
+    async with AsyncSessionLocal() as session:
+        # 1. Add profile columns to organizations if missing
+        try:
+            await session.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS phone_number VARCHAR NULL"))
+            await session.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS website VARCHAR NULL"))
+            await session.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS timezone VARCHAR NULL DEFAULT 'UTC'"))
+            await session.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS country VARCHAR NULL"))
+            await session.commit()
+            logger.info("Verified profile columns on organizations table")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed adding profile columns to organizations table", error=str(e))
+
+        # 2. Create organization_settings table
+        try:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS organization_settings (
+                    organization_id UUID PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+                    sender_display_name VARCHAR NULL,
+                    reply_to_email VARCHAR NULL,
+                    default_signature TEXT NULL,
+                    cc_emails TEXT[] DEFAULT '{}',
+                    bcc_emails TEXT[] DEFAULT '{}',
+                    ai_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    reply_style VARCHAR NOT NULL DEFAULT 'Professional',
+                    reply_length VARCHAR NOT NULL DEFAULT 'Medium',
+                    scheduler_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    scheduler_interval_minutes INTEGER NOT NULL DEFAULT 15,
+                    business_hours_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    working_days TEXT[] DEFAULT '{"Mon","Tue","Wed","Thu","Fri"}',
+                    start_time VARCHAR NOT NULL DEFAULT '09:00',
+                    end_time VARCHAR NOT NULL DEFAULT '18:00',
+                    last_scheduler_run TIMESTAMP WITH TIME ZONE NULL,
+                    notify_failed_replies BOOLEAN NOT NULL DEFAULT TRUE,
+                    notify_outlook_disconnect BOOLEAN NOT NULL DEFAULT TRUE,
+                    daily_summary_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                )
+            """))
+            await session.commit()
+            logger.info("Verified table: organization_settings")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed migrating organization_settings", error=str(e))
+
+        # 3. Seed default rows for any organizations that don't have them
+        try:
+            await session.execute(text("""
+                INSERT INTO organization_settings (organization_id)
+                SELECT id FROM organizations
+                ON CONFLICT (organization_id) DO NOTHING
+            """))
+            await session.commit()
+            logger.info("Initialized default settings for organizations")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed to seed default settings for organizations", error=str(e))
+
+
 if __name__ == "__main__":
     async def main():
         await run_engagement_migrations()
         await run_ai_reply_migrations()
+        await run_organization_settings_migrations()
     asyncio.run(main())

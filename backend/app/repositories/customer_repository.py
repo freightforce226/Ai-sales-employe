@@ -119,9 +119,9 @@ class CustomerRepository:
             text("""
                 UPDATE customers 
                 SET deleted_at = NOW() 
-                WHERE id IN :ids AND organization_id = :org_id AND deleted_at IS NULL
+                WHERE id = ANY(:ids) AND organization_id = :org_id AND deleted_at IS NULL
             """),
-            {"ids": tuple(customer_ids), "org_id": self.org_id}
+            {"ids": list(customer_ids), "org_id": self.org_id}
         )
         return res.rowcount
 

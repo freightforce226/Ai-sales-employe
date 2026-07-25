@@ -5,6 +5,7 @@ import json
 
 sys.path.insert(0, r'c:\Users\golu\Desktop\freightforce.ai\backend')
 from app.db.session import AsyncSessionLocal
+from app.services.email_branding_service import EmailBrandingService
 from sqlalchemy import text
 
 async def update_db_signature(signature: str):
@@ -36,22 +37,30 @@ async def run_integration_test():
     forbidden = [
         "Regards", "Best Regards", "Kind Regards", "Warm Regards",
         "Thanks & Regards", "Sincerely", "AI Sales Agent", 
-        "Automation Engineer", "Phone:", "Mobile:", "Email:", "--"
+        "Automation Engineer", "Phone", "Mobile", "Email", "--"
     ]
 
     # --- Scenario A: No Organization Signature Configured ---
-    print("\n--- Scenario A: Testing with EMPTY organization signature ---")
+    print("\n--- Scenario A: Testing API output with EMPTY organization signature ---")
     await update_db_signature("")
     
     res_a = requests.post(url, headers=headers, json=payload)
     assert res_a.status_code == 200
     body_a = res_a.json().get("reply_body", "")
-    print("Response reply_body (No signature):\n", body_a)
+    print("Response reply_body:\n", body_a)
     
+    # Word count assertion
+    word_count_a = len(body_a.split())
+    print(f"Word count for Scenario A: {word_count_a}")
+    assert word_count_a <= 60, f"Word count exceeds 60 words: {word_count_a}"
+    
+    # Greeting strategy assertion (starts with Hi)
+    assert body_a.strip().startswith("Hi"), "Greeting strategy failed: Reply does not start with Hi"
+
     failed_a = False
     for term in forbidden:
         if term.lower() in body_a.lower():
-            print(f"FAIL: reply_body contains signature element under Scenario A: '{term}'")
+            print(f"FAIL: reply_body contains signature element: '{term}'")
             failed_a = True
         else:
             print(f"PASS: '{term}' not found.")
@@ -60,36 +69,57 @@ async def run_integration_test():
 
     # --- Scenario B: With Organization Signature Configured ---
     test_signature = "Best regards,\nGourav Sharma\nAutomation Engineer\nPhone: 8209427429"
-    print("\n--- Scenario B: Testing with CONFIGURED organization signature ---")
+    print("\n--- Scenario B: Testing API output with CONFIGURED organization signature ---")
     await update_db_signature(test_signature)
 
     res_b = requests.post(url, headers=headers, json=payload)
     assert res_b.status_code == 200
     body_b = res_b.json().get("reply_body", "")
-    print("Response reply_body (With signature):\n", body_b)
+    print("Response reply_body:\n", body_b)
 
-    # 1. Assert exactly one signature block is appended (split by signature separator "--")
-    parts = body_b.split("\n\n--\n")
-    print(f"Split count by '--': {len(parts)}")
-    assert len(parts) == 2, f"Expected exactly one signature separator '--', found {len(parts) - 1}!"
+    # Word count assertion
+    word_count_b = len(body_b.split())
+    print(f"Word count for Scenario B: {word_count_b}")
+    assert word_count_b <= 60, f"Word count exceeds 60 words: {word_count_b}"
     
-    llm_part = parts[0]
-    signature_part = parts[1]
+    assert body_b.strip().startswith("Hi"), "Greeting strategy failed: Reply does not start with Hi"
 
-    # 2. Assert LLM part has no signature elements
+    # In Scenario B, the API output itself must STILL be signature-free
     failed_b = False
     for term in forbidden:
-        if term.lower() in llm_part.lower():
-            print(f"FAIL: LLM generated portion contains signature element: '{term}'")
+        if term.lower() in body_b.lower():
+            print(f"FAIL: API reply_body contains signature element under Scenario B: '{term}'")
             failed_b = True
         else:
-            print(f"PASS: '{term}' not found in LLM portion.")
+            print(f"PASS: '{term}' not found.")
             
-    assert not failed_b, "Scenario B failed: Signature elements leaked into the LLM narrative body!"
+    assert not failed_b, "Scenario B failed: Signature elements leaked into API output reply_body!"
 
-    # 3. Assert signature part matches the configured signature
-    assert "gourav sharma" in signature_part.lower(), "Configured signature was not appended correctly!"
-    
+    # --- Scenario C: Verify Final HTML & Plain Text Send Mail compilation ---
+    print("\n--- Scenario C: Testing outbound builder (EmailBrandingService) signature compilation ---")
+    async with AsyncSessionLocal() as session:
+        branding = EmailBrandingService(session)
+        cleaned_body = branding.clean_and_format_body(body_b)
+        
+        final_html = branding.render_html_email(
+            body_content=cleaned_body,
+            signature_html="Best regards,<br>Gourav Sharma<br>Automation Engineer<br>Phone: 8209427429",
+            banner_url=None
+        )
+        final_plain = branding.render_plain_email(final_html)
+        
+        # Verify exactly one signature block exists in HTML
+        print("\nChecking HTML output...")
+        assert "gourav sharma" in final_html.lower(), "Signature missing from final HTML!"
+        assert final_html.lower().count("gourav sharma") == 1, "Duplicate signature block in HTML!"
+        print("PASS: Exactly one signature block found in HTML.")
+
+        # Verify exactly one signature block exists in Plain Text
+        print("\nChecking Plain Text output...")
+        assert "gourav sharma" in final_plain.lower(), "Signature missing from final Plain Text!"
+        assert final_plain.lower().count("gourav sharma") == 1, "Duplicate signature block in Plain Text!"
+        print("PASS: Exactly one signature block found in Plain Text.")
+        
     print("\nResult: ALL INTEGRATION TESTS PASSED SUCCESSFULLY!")
 
 if __name__ == "__main__":

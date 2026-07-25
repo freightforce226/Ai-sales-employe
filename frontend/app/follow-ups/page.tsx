@@ -6,8 +6,9 @@ import { AppShell } from '../../components/layout/shell';
 import { PageWrapper, PageHeader } from '../../components/layout/page-wrapper';
 import { Card } from '../../components/ui/card';
 import { Button } from '../../components/ui/button';
+import { Badge, Alert } from '../../components/ui/feedback';
+import { ConfirmationModal } from '../../components/ui/confirmation-modal';
 import { Input } from '../../components/ui/input';
-import { Badge } from '../../components/ui/feedback';
 import {
   Play,
   Pause,
@@ -114,6 +115,18 @@ export default function FollowUpsModulePage() {
   const [newProfileDesc, setNewProfileDesc] = useState('');
   const [creatingProfile, setCreatingProfile] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
+
+  // Modal states
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deletingProfileId, setDeletingProfileId] = useState<string | null>(null);
+  const [deletingProfileName, setDeletingProfileName] = useState<string>('');
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [alertInfo, setAlertInfo] = useState<{ variant: 'success' | 'danger'; title: string; message: string } | null>(null);
+
+  const showToast = (variant: 'success' | 'danger', title: string, message: string) => {
+    setAlertInfo({ variant, title, message });
+    setTimeout(() => setAlertInfo(null), 4000);
+  };
 
   useEffect(() => {
     fetchInitialData();
@@ -321,27 +334,40 @@ export default function FollowUpsModulePage() {
 
       // Simulate cloning of files metadata by posting file records
       // Since it's mockup for file buffers, we reload profiles
-      alert(`Cloned "${profile.name}" successfully as "Copy of ${profile.name}"`);
+      showToast('success', 'Profile Cloned', `Cloned "${profile.name}" successfully as "Copy of ${profile.name}"`);
       await fetchInitialData();
     } catch (err) {
       console.error("Clone error", err);
     }
   };
 
-  const handleDeleteProfile = async (profileId: string, profileName: string) => {
+  const handleDeleteProfile = (profileId: string, profileName: string) => {
     // Safety check: is it referenced by active steps?
     const activeReference = steps.find(s => s.is_enabled && s.attachment_profile_id === profileId);
     if (activeReference) {
-      alert(`Cannot delete profile "${profileName}": It is currently referenced by active Follow-up Stage Step ${activeReference.step_number}.`);
+      showToast('danger', 'Cannot Delete Profile', `It is currently referenced by active Follow-up Stage Step ${activeReference.step_number}.`);
       return;
     }
 
-    if (!confirm(`Are you sure you want to delete profile "${profileName}"? This action cannot be undone.`)) return;
+    setDeletingProfileId(profileId);
+    setDeletingProfileName(profileName);
+    setDeleteModalOpen(true);
+  };
+
+  const confirmDeleteProfile = async () => {
+    if (!deletingProfileId) return;
     try {
-      await api.delete(`/api/v1/follow-ups/attachment-profiles/${profileId}`);
-      setProfiles(profiles.filter(p => p.id !== profileId));
+      setIsDeleting(true);
+      await api.delete(`/api/v1/follow-ups/attachment-profiles/${deletingProfileId}`);
+      setProfiles(profiles.filter(p => p.id !== deletingProfileId));
+      showToast('success', 'Profile Deleted', `Successfully deleted profile "${deletingProfileName}".`);
     } catch (err) {
       console.error("Delete profile error", err);
+      showToast('danger', 'Deletion Failed', 'Failed to delete follow-up profile.');
+    } finally {
+      setIsDeleting(false);
+      setDeleteModalOpen(false);
+      setDeletingProfileId(null);
     }
   };
 
@@ -429,6 +455,16 @@ export default function FollowUpsModulePage() {
   return (
     <AppShell>
       <PageWrapper>
+        {alertInfo && (
+          <div className="fixed top-4 right-4 z-[60] w-full max-w-md animate-in fade-in slide-in-from-top-4 duration-200">
+            <Alert 
+              variant={alertInfo.variant} 
+              title={alertInfo.title} 
+              description={alertInfo.message} 
+              onClose={() => setAlertInfo(null)} 
+            />
+          </div>
+        )}
         <div className="space-y-6">
           <PageHeader
             title="Follow-ups Manager"
@@ -1050,6 +1086,17 @@ export default function FollowUpsModulePage() {
             onApprove={async (id) => handleQueueAction(id, 'approve')}
           />
         </div>
+
+        <ConfirmationModal
+          isOpen={deleteModalOpen}
+          onClose={() => setDeleteModalOpen(false)}
+          onConfirm={confirmDeleteProfile}
+          title="Delete Follow-up Profile"
+          message={`Are you sure you want to delete profile "${deletingProfileName}"? This action cannot be undone.`}
+          confirmText="Delete Profile"
+          isLoading={isDeleting}
+          variant="destructive"
+        />
       </PageWrapper>
     </AppShell>
   );

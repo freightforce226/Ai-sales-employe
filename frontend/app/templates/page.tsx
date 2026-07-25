@@ -6,8 +6,9 @@ import { AppShell } from '../../components/layout/shell';
 import { PageWrapper, PageHeader } from '../../components/layout/page-wrapper';
 import { Card, MetricCard } from '../../components/ui/card';
 import { Button } from '../../components/ui/button';
-import { Badge } from '../../components/ui/feedback';
+import { Badge, Alert } from '../../components/ui/feedback';
 import { Input, Select } from '../../components/ui/input';
+import { ConfirmationModal } from '../../components/ui/confirmation-modal';
 import { 
   FileText, 
   Plus, 
@@ -99,7 +100,6 @@ Regards,
 {{sender_company}}`;
 
 export default function TemplatesPage() {
-  const [activeTab, setActiveTab] = useState<'templates' | 'signature'>('templates');
   const router = useRouter();
   const { user } = useTenantStore();
 
@@ -125,6 +125,21 @@ export default function TemplatesPage() {
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'unsaved'>('saved');
   const [saveSuccessMessage, setSaveSuccessMessage] = useState(false);
+
+  // Modal states
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deletingTemplate, setDeletingTemplate] = useState<Template | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  const [starterModalOpen, setStarterModalOpen] = useState(false);
+  const [discardModalOpen, setDiscardModalOpen] = useState(false);
+
+  const [alertInfo, setAlertInfo] = useState<{ variant: 'success' | 'danger'; title: string; message: string } | null>(null);
+
+  const showToast = (variant: 'success' | 'danger', title: string, message: string) => {
+    setAlertInfo({ variant, title, message });
+    setTimeout(() => setAlertInfo(null), 4000);
+  };
   
   // Editor form values
   const [formName, setFormName] = useState('');
@@ -327,17 +342,19 @@ export default function TemplatesPage() {
     }
   }, [formSubject, formBody, formName, formIndustry, formStatus]);
 
-  const handleCopyVariable = (variableName: string) => {
+  const handleVariableClick = (variableName: string) => {
     navigator.clipboard.writeText(`{{${variableName}}}`);
-    alert(`Copied {{${variableName}}} to clipboard!`);
+    showToast('success', 'Variable Copied', `Copied {{${variableName}}} to clipboard.`);
   };
 
   const handleLoadStarterTemplate = () => {
-    const confirm = window.confirm("Load Starter Template? This will replace your current email body text.");
-    if (confirm) {
-      setFormBody(STARTER_TEMPLATE);
-      setHasUnsavedChanges(true);
-    }
+    setStarterModalOpen(true);
+  };
+
+  const confirmLoadStarterTemplate = () => {
+    setFormBody(STARTER_TEMPLATE);
+    setHasUnsavedChanges(true);
+    setStarterModalOpen(false);
   };
 
   const handleOpenCreateModal = () => {
@@ -370,10 +387,15 @@ export default function TemplatesPage() {
 
   const handleCloseEditorModal = () => {
     if (hasUnsavedChanges || saveStatus === 'unsaved') {
-      const confirm = window.confirm("You have unsaved changes. Are you sure you want to discard them?");
-      if (!confirm) return;
+      setDiscardModalOpen(true);
+    } else {
+      setIsEditorOpen(false);
     }
+  };
+
+  const confirmDiscardChanges = () => {
     setIsEditorOpen(false);
+    setDiscardModalOpen(false);
   };
 
   const validateFields = () => {
@@ -422,29 +444,34 @@ export default function TemplatesPage() {
     } catch (err: any) {
       setSaveStatus('unsaved');
       console.error(err);
-      alert(err.response?.data?.detail || "An error occurred while saving the template.");
+      showToast('danger', 'Save Failed', err.response?.data?.detail || "An error occurred while saving the template.");
     }
   };
 
   const handleDuplicate = async (t: Template) => {
     try {
       await api.post(`/api/v1/templates/${t.id}/duplicate`);
+      showToast('success', 'Template Duplicated', 'Successfully duplicated the email template.');
       fetchTemplates();
     } catch (err: any) {
-      alert(err.response?.data?.detail || "Failed to duplicate template.");
+      showToast('danger', 'Duplication Failed', err.response?.data?.detail || "Failed to duplicate template.");
     }
   };
 
-  const handleDelete = async (t: Template) => {
-    const confirm = window.confirm(`Delete this template permanently?\n\nThis action cannot be undone.`);
-    if (!confirm) return;
-
+  const confirmDelete = async () => {
+    if (!deletingTemplate) return;
     try {
-      await api.delete(`/api/v1/templates/${t.id}`);
+      setIsDeleting(true);
+      await api.delete(`/api/v1/templates/${deletingTemplate.id}`);
+      showToast('success', 'Template Deleted', `Successfully deleted "${deletingTemplate.template_name}".`);
       fetchTemplates();
     } catch (err) {
       console.error(err);
-      alert("Failed to delete template.");
+      showToast('danger', 'Deletion Failed', 'Failed to delete template.');
+    } finally {
+      setIsDeleting(false);
+      setDeleteModalOpen(false);
+      setDeletingTemplate(null);
     }
   };
 
@@ -488,44 +515,27 @@ export default function TemplatesPage() {
   return (
     <AppShell>
       <PageWrapper>
+        {alertInfo && (
+          <div className="fixed top-4 right-4 z-[60] w-full max-w-md animate-in fade-in slide-in-from-top-4 duration-200">
+            <Alert 
+              variant={alertInfo.variant} 
+              title={alertInfo.title} 
+              description={alertInfo.message} 
+              onClose={() => setAlertInfo(null)} 
+            />
+          </div>
+        )}
         <div className="space-y-6">
           <PageHeader 
-            title="Templates & Signatures"
-            description="Manage reusable email templates and default organization signatures."
+            title="Templates"
+            description="Manage reusable email templates."
             actions={
-              activeTab === 'templates' && (
-                <Button variant="primary" onClick={handleOpenCreateModal} className="flex items-center gap-1.5 cursor-pointer shadow-sm">
-                  <Plus className="w-4 h-4" />
-                  <span>New Template</span>
-                </Button>
-              )
+              <Button variant="primary" onClick={handleOpenCreateModal} className="flex items-center gap-1.5 cursor-pointer shadow-sm">
+                <Plus className="w-4 h-4" />
+                <span>New Template</span>
+              </Button>
             }
           />
-
-          {/* Tab Switcher */}
-          <div className="flex border-b border-border-color pb-1 mb-4 select-none">
-            <button
-              onClick={() => setActiveTab('templates')}
-              className={`px-4 py-2 text-xs font-bold transition-all border-b-2 cursor-pointer ${
-                activeTab === 'templates' ? 'border-brand-primary text-text-primary' : 'border-transparent text-text-secondary hover:text-text-primary'
-              }`}
-            >
-              Templates
-            </button>
-            <button
-              onClick={() => setActiveTab('signature')}
-              className={`px-4 py-2 text-xs font-bold transition-all border-b-2 cursor-pointer ${
-                activeTab === 'signature' ? 'border-brand-primary text-text-primary' : 'border-transparent text-text-secondary hover:text-text-primary'
-              }`}
-            >
-              Signature Settings
-            </button>
-          </div>
-
-          {activeTab === 'signature' ? (
-            <SignatureTab />
-          ) : (
-            <>
               {/* METRICS */}
               {loading ? (
                 <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -663,7 +673,7 @@ export default function TemplatesPage() {
                           <Button variant="secondary" size="sm" onClick={() => handleDuplicate(t)} title="Duplicate">
                             <Copy className="w-3.5 h-3.5 text-text-muted" />
                           </Button>
-                          <Button variant="secondary" size="sm" onClick={() => handleDelete(t)} title="Delete" className="text-status-danger hover:bg-rose-50 border-rose-100 hover:text-status-danger transition-all">
+                          <Button variant="secondary" size="sm" onClick={() => { setDeletingTemplate(t); setDeleteModalOpen(true); }} title="Delete" className="text-status-danger hover:bg-rose-50 border-rose-100 hover:text-status-danger transition-all">
                             <Trash2 className="w-3.5 h-3.5" />
                           </Button>
                         </td>
@@ -699,8 +709,6 @@ export default function TemplatesPage() {
                 </div>
               )}
             </Card>
-          )}
-          </>
           )}
 
           {/* VIEW TEMPLATE CENTERED MODAL */}
@@ -1013,6 +1021,37 @@ export default function TemplatesPage() {
           )}
 
         </div>
+
+        <ConfirmationModal
+          isOpen={deleteModalOpen}
+          onClose={() => setDeleteModalOpen(false)}
+          onConfirm={confirmDelete}
+          title="Delete Template"
+          message={`Are you sure you want to permanently delete "${deletingTemplate?.template_name}"? This action cannot be undone.`}
+          confirmText="Delete Template"
+          isLoading={isDeleting}
+          variant="destructive"
+        />
+
+        <ConfirmationModal
+          isOpen={starterModalOpen}
+          onClose={() => setStarterModalOpen(false)}
+          onConfirm={confirmLoadStarterTemplate}
+          title="Load Starter Template?"
+          message="This will completely replace your current email body text with the starter template. Do you wish to continue?"
+          confirmText="Load Template"
+          variant="warning"
+        />
+
+        <ConfirmationModal
+          isOpen={discardModalOpen}
+          onClose={() => setDiscardModalOpen(false)}
+          onConfirm={confirmDiscardChanges}
+          title="Discard Unsaved Changes?"
+          message="You have unsaved modifications in this template. Are you sure you want to discard them and close the editor?"
+          confirmText="Discard Changes"
+          variant="warning"
+        />
       </PageWrapper>
     </AppShell>
   );

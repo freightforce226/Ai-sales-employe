@@ -19,7 +19,8 @@ import {
   Paperclip,
   MoreHorizontal,
   Menu,
-  Clock
+  Clock,
+  MessageSquare
 } from 'lucide-react';
 import { useTenantStore } from '../../store/tenant-store';
 import { api } from '../../lib/api';
@@ -76,8 +77,10 @@ export function AppShell({ children }: AppShellProps) {
   const secondaryNavItems = [
     { name: 'Campaigns', href: '/campaigns', icon: Send },
     { name: 'Engagement', href: '/engagement', icon: Send },
+    { name: '🤖 AI Customer Replies', href: '/ai-replies', icon: MessageSquare },
     { name: 'Attachments', href: '/attachments', icon: Paperclip },
     { name: 'Analytics', href: '/analytics', icon: BarChart3 },
+    { name: 'Settings', href: '/settings', icon: Settings },
   ];
 
   return (
