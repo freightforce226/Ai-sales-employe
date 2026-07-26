@@ -11,4 +11,5 @@ structlog==24.4.0
 tenacity==9.0.0
 email-validator>=2.0.0
 python-multipart==0.0.20
-
+beautifulsoup4==4.12.3
+bleach==6.2.0
