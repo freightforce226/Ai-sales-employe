@@ -12,9 +12,11 @@ from app.core.auth import get_current_user
 from app.models.user import User
 from app.db.session import get_db_session
 from app.schemas.oauth import OAuthCallbackResponse, OAuthConnectResponse
+from app.core.config import get_settings
 from app.services.oauth_service import OAuthService
 
 router = APIRouter(tags=["OAuth"])
+settings = get_settings()
 
 
 @router.get("/connect", response_model=OAuthConnectResponse)
@@ -68,8 +70,8 @@ async def oauth_callback(
     oauth_service = OAuthService(session)
     try:
         await oauth_service.handle_callback(code, state)
-        return RedirectResponse(url="http://localhost:3000/dashboard?outlook=success")
+        return RedirectResponse(url=f"{settings.frontend_url}/dashboard?outlook=success")
     except ValueError as e:
-        return RedirectResponse(url=f"http://localhost:3000/dashboard?outlook=error&error={str(e)}")
+        return RedirectResponse(url=f"{settings.frontend_url}/dashboard?outlook=error&error={str(e)}")
     except Exception:
-        return RedirectResponse(url="http://localhost:3000/dashboard?outlook=error")
+        return RedirectResponse(url=f"{settings.frontend_url}/dashboard?outlook=error")

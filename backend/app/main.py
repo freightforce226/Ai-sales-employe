@@ -158,6 +158,11 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down FastAPI application")
 
 
+if "*" in settings.allowed_origins_list:
+    raise ValueError(
+        "Wildcard origins cannot be used when allow_credentials=True. Configure ALLOWED_ORIGINS with explicit frontend URLs."
+    )
+
 app = FastAPI(
     title="FreightForce AI - Outlook Integration Service",
     description="Multi-tenant service for sending emails via Microsoft Graph API",
