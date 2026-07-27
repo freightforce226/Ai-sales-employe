@@ -53,12 +53,14 @@ class MeResponse(BaseModel):
 # Utility to set HttpOnly cookies
 def set_auth_cookies(response: Response, access_token: str, refresh_token: str, expires_in: int = 3600):
     is_prod = settings.environment == "production"
+    samesite = "none" if is_prod else "lax"
+    secure = True if is_prod else False
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
-        secure=is_prod,
-        samesite="lax",
+        secure=secure,
+        samesite=samesite,
         max_age=expires_in,
         path="/"
     )
@@ -67,8 +69,8 @@ def set_auth_cookies(response: Response, access_token: str, refresh_token: str, 
             key="refresh_token",
             value=refresh_token,
             httponly=True,
-            secure=is_prod,
-            samesite="lax",
+            secure=secure,
+            samesite=samesite,
             max_age=30 * 24 * 3600, # 30 days
             path="/"
         )
@@ -76,8 +78,20 @@ def set_auth_cookies(response: Response, access_token: str, refresh_token: str, 
 # Utility to clear cookies
 def clear_auth_cookies(response: Response):
     is_prod = settings.environment == "production"
-    response.delete_cookie(key="access_token", path="/", secure=is_prod, samesite="lax")
-    response.delete_cookie(key="refresh_token", path="/", secure=is_prod, samesite="lax")
+    samesite = "none" if is_prod else "lax"
+    secure = True if is_prod else False
+    response.delete_cookie(
+        key="access_token",
+        path="/",
+        secure=secure,
+        samesite=samesite
+    )
+    response.delete_cookie(
+        key="refresh_token",
+        path="/",
+        secure=secure,
+        samesite=samesite
+    )
 
 @router.post("/signup", response_model=SignupResponse)
 async def signup(request: SignupRequest, response: Response, db: AsyncSession = Depends(get_db_session)):
