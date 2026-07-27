@@ -16,7 +16,7 @@
     "axios": "^1.18.1",
     "framer-motion": "^12.42.0",
     "lucide-react": "^1.21.0",
-    "next": "15.1.7",
+    "next": "15.5.22",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-hook-form": "^7.80.0",
@@ -29,7 +29,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "15.1.7",
+    "eslint-config-next": "15.5.22",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
