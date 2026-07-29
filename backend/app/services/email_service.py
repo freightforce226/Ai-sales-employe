@@ -10,11 +10,10 @@ from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
-from app.clients.microsoft_graph_client import MicrosoftGraphClient
-from app.core.exceptions import EmailSendError, GraphApiError, TenantNotFoundError, TokenRefreshError
+from app.providers import EmailProviderFactory, BaseEmailProvider
+from app.core.exceptions import EmailSendError, GraphApiError, TenantNotFoundError
 from app.core.logging import get_logger
 from app.schemas.email import EmailRequest, EmailResponse
-from app.services.token_service import TokenService
 from app.core.config import get_settings
 
 logger = get_logger(__name__)
@@ -118,94 +117,53 @@ async def _fetch_and_cache_attachment(storage_path: str, strict: bool, stats: di
 class EmailService:
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.token_service = TokenService(session)
-        self.graph_client = MicrosoftGraphClient()
+        self.provider_factory = EmailProviderFactory(session)
 
     async def _send_new_email(
         self,
         request: EmailRequest,
-        access_token: str,
+        provider: BaseEmailProvider,
         final_html_body: str,
         graph_attachments: list,
+        cc_emails: list,
+        bcc_emails: list,
         prefix: str
     ) -> str:
         from app.core.debug_logger import log_to_request_file
         log_to_request_file("Executing Scenario 2: Standard Outbound Email (sendMail)")
-        return await self.graph_client.send_email(
-            access_token=access_token,
+        return await provider.send_email(
+            org_id=request.organization_id,
+            recipient=request.customer_email,
             subject=request.subject,
-            html_content=final_html_body,
-            to_email=request.customer_email,
-            attachments=graph_attachments
+            html_body=final_html_body,
+            cc_emails=cc_emails,
+            bcc_emails=bcc_emails,
+            attachments=graph_attachments,
+            db_session=self.session
         )
 
     async def _send_threaded_reply(
         self,
         request: EmailRequest,
-        access_token: str,
+        provider: BaseEmailProvider,
         final_html_body: str,
         graph_attachments: list,
         parent_message_id: str,
-        cc_list: list,
+        cc_emails: list,
+        bcc_emails: list,
         prefix: str
     ) -> str:
         from app.core.debug_logger import log_to_request_file
         log_to_request_file(f"Executing Scenario 1: Threaded Reply on parent message ID {parent_message_id}")
-        draft_id = None
-        max_attempts = 3
-        last_err = None
-        
-        for attempt in range(max_attempts):
-            try:
-                # 1. Create draft reply
-                draft_id = await self.graph_client.create_reply_draft(access_token, parent_message_id)
-                
-                # 2. Update draft body and CC list
-                await self.graph_client.update_message_draft(
-                    access_token=access_token,
-                    draft_id=draft_id,
-                    html_content=final_html_body,
-                    cc_emails=cc_list
-                )
-                
-                # 3. Add attachments if present
-                if graph_attachments:
-                    for attachment in graph_attachments:
-                        attach_url = f"https://graph.microsoft.com/v1.0/me/messages/{draft_id}/attachments"
-                        headers_att = {
-                            "Authorization": f"Bearer {access_token}",
-                            "Content-Type": "application/json"
-                        }
-                        async with httpx.AsyncClient(timeout=30.0) as client:
-                            res_att = await client.post(attach_url, headers=headers_att, json=attachment)
-                            if res_att.status_code not in (200, 201):
-                                raise Exception(f"Failed to upload attachment: {res_att.text}")
-                                
-                # 4. Send draft reply
-                await self.graph_client.send_draft(access_token, draft_id)
-                
-                logger.info("Successfully executed Graph reply flow")
-                log_to_request_file("Successfully executed Graph reply flow")
-                return draft_id
-            except Exception as attempt_err:
-                last_err = attempt_err
-                logger.warning(f"Threaded reply attempt {attempt+1} failed: {str(attempt_err)}")
-                log_to_request_file(f"Threaded reply attempt {attempt+1} failed: {str(attempt_err)}")
-                
-                # Cleanup draft if created
-                if draft_id:
-                    try:
-                        await self.graph_client.delete_draft(access_token, draft_id)
-                        log_to_request_file(f"Successfully cleaned up draft: {draft_id}")
-                    except Exception as del_err:
-                        logger.warning("Failed to delete failed draft during cleanup", error=str(del_err))
-                    draft_id = None
-                    
-                if attempt < max_attempts - 1:
-                    await asyncio.sleep(2 ** attempt)
-        else:
-            logger.error("All threaded reply attempts failed. Aborting dispatch.")
-            raise last_err
+        return await provider.send_reply(
+            org_id=request.organization_id,
+            parent_message_id=parent_message_id,
+            html_body=final_html_body,
+            cc_emails=cc_emails,
+            bcc_emails=bcc_emails,
+            attachments=graph_attachments,
+            db_session=self.session
+        )
 
     async def send_tenant_email(self, request: EmailRequest) -> EmailResponse:
         import traceback
@@ -304,16 +262,33 @@ class EmailService:
             async with StepTracker(4, "Download attachment"):
                 if request.attachments:
                     stats = {"hits": 0, "misses": 0, "total_bytes": 0}
-                    tasks = [
-                        _fetch_and_cache_attachment(
-                            att.storage_path,
-                            request.strict_attachment_mode,
-                            stats
-                        )
-                        for att in request.attachments
-                    ]
-                    results = await asyncio.gather(*tasks)
-                    graph_attachments = [r for r in results if r is not None]
+                    tasks = []
+                    for att in request.attachments:
+                        storage_path = att.storage_path
+                        if not storage_path and att.id:
+                            # Query storage_path (file_path) from follow_up_attachment_files using id
+                            res_att = await self.session.execute(
+                                text("SELECT file_path FROM follow_up_attachment_files WHERE id = :id"),
+                                {"id": att.id}
+                            )
+                            row_att = res_att.fetchone()
+                            if row_att:
+                                storage_path = row_att[0]
+                        
+                        if storage_path:
+                            tasks.append(
+                                _fetch_and_cache_attachment(
+                                    storage_path,
+                                    request.strict_attachment_mode,
+                                    stats
+                                )
+                            )
+                        elif request.strict_attachment_mode:
+                            raise EmailSendError(f"Attachment storage path could not be resolved for ID: {att.id}")
+                    
+                    if tasks:
+                        results = await asyncio.gather(*tasks)
+                        graph_attachments = [r for r in results if r is not None]
                 log_to_request_file(f"Attachment download result: {len(graph_attachments)} attachments downloaded.")
         except Exception as e:
             tb_str = traceback.format_exc()
@@ -325,20 +300,9 @@ class EmailService:
             await self.session.rollback()
             raise e
 
-        # Load token
-        log_to_request_file("Token refresh: Start")
-        try:
-            access_token = await self.token_service.get_valid_access_token(request.organization_id)
-            log_to_request_file("Token refresh result: Success")
-        except Exception as e:
-            tb_str = traceback.format_exc()
-            print(type(e))
-            print(repr(e))
-            traceback.print_exc()
-            log_to_request_file(f"Exception in Token refresh: {type(e)} - {repr(e)}\nTraceback:\n{tb_str}")
-            logger.exception("ORIGINAL ERROR")
-            await self.session.rollback()
-            raise e
+        # Resolve email provider dynamically via factory
+        factory = EmailProviderFactory(self.session)
+        provider = await factory.get_provider_for_tenant(request.organization_id)
 
         # Load Signature Settings
         try:
@@ -480,8 +444,37 @@ class EmailService:
             # Priority 3: Brand-new outbound message -> Go straight to sendMail flow without DB query
             log_to_request_file("Priority 3: Brand-new outbound message. Proceeding straight to sendMail flow.")
 
-        # Load default CC emails from organization AI settings table
-        cc_list = []
+        # Load default CC/BCC from organization settings table
+        org_cc = []
+        org_bcc = []
+        try:
+            org_settings_res = await self.session.execute(text("""
+                SELECT cc_emails, bcc_emails FROM organization_settings WHERE organization_id = :org_id
+            """), {"org_id": request.organization_id})
+            org_settings_row = org_settings_res.fetchone()
+            if org_settings_row:
+                org_cc = org_settings_row[0] or []
+                org_bcc = org_settings_row[1] or []
+        except Exception as org_settings_ex:
+            logger.warning("Failed to load CC/BCC from organization settings", error=str(org_settings_ex))
+
+        # Recipient Merge Priority Rules:
+        # - Request TO is highest priority.
+        # - Request CC is merged first.
+        # - Organization default CC is appended.
+        # - Request BCC is merged first.
+        # - Organization default BCC is appended.
+        # - Deduplicate case-insensitively.
+        # - Remove duplicates across TO, CC and BCC.
+        # - Ignore empty or whitespace-only values.
+
+        primary_to = request.customer_email.strip().lower()
+
+        # Build CC list
+        raw_cc_list = list(request.cc_emails or [])
+        
+        # Load legacy default CC for backward compatibility on replies
+        legacy_cc_list = []
         try:
             settings_res = await self.session.execute(text("""
                 SELECT default_cc_emails FROM organization_ai_settings WHERE organization_id = :org_id
@@ -489,9 +482,44 @@ class EmailService:
             settings_row = settings_res.fetchone()
             if settings_row and settings_row[0]:
                 import json
-                cc_list = json.loads(settings_row[0]) if isinstance(settings_row[0], str) else settings_row[0]
+                legacy_cc_list = json.loads(settings_row[0]) if isinstance(settings_row[0], str) else settings_row[0]
         except Exception as settings_ex:
             logger.warning("Failed to load default CC emails from AI settings", error=str(settings_ex))
+
+        # Append legacy CC if reply is expected
+        if is_reply_expected:
+            raw_cc_list.extend(legacy_cc_list)
+
+        # Append organization settings default CC
+        raw_cc_list.extend(org_cc)
+
+        # Clean and deduplicate CC
+        merged_cc = []
+        seen_cc = set()
+        for cc in raw_cc_list:
+            if cc and cc.strip():
+                clean_cc = cc.strip()
+                clean_cc_lower = clean_cc.lower()
+                if clean_cc_lower != primary_to and clean_cc_lower not in seen_cc:
+                    merged_cc.append(clean_cc)
+                    seen_cc.add(clean_cc_lower)
+
+        # Build BCC list
+        raw_bcc_list = list(request.bcc_emails or [])
+        raw_bcc_list.extend(org_bcc)
+
+        # Clean and deduplicate BCC
+        merged_bcc = []
+        seen_bcc = set()
+        for bcc in raw_bcc_list:
+            if bcc and bcc.strip():
+                clean_bcc = bcc.strip()
+                clean_bcc_lower = clean_bcc.lower()
+                if (clean_bcc_lower != primary_to and 
+                    clean_bcc_lower not in seen_cc and 
+                    clean_bcc_lower not in seen_bcc):
+                    merged_bcc.append(clean_bcc)
+                    seen_bcc.add(clean_bcc_lower)
 
         # STEP 6: Send Graph Email
         try:
@@ -506,20 +534,23 @@ class EmailService:
                 async with StepTracker(6, "Send Graph Threaded Reply"):
                     message_id = await self._send_threaded_reply(
                         request=request,
-                        access_token=access_token,
+                        provider=provider,
                         final_html_body=final_html_body,
                         graph_attachments=graph_attachments,
                         parent_message_id=parent_graph_message_id,
-                        cc_list=cc_list,
+                        cc_emails=merged_cc,
+                        bcc_emails=merged_bcc,
                         prefix=prefix
                     )
             else:
                 async with StepTracker(6, "Send Graph Email"):
                     message_id = await self._send_new_email(
                         request=request,
-                        access_token=access_token,
+                        provider=provider,
                         final_html_body=final_html_body,
                         graph_attachments=graph_attachments,
+                        cc_emails=merged_cc,
+                        bcc_emails=merged_bcc,
                         prefix=prefix
                     )
             logger.info("GRAPH API SUCCESS")
@@ -554,15 +585,23 @@ class EmailService:
         true_msg_id = message_id
         true_conv_id = request.conversation_id or request.thread_id
         true_thread_id = request.thread_id or request.conversation_id
-        true_internet_id = request.internet_message_id
+        true_internet_id = request.internet_message_id or message_id
+        
+        # If thread_id / conv_id are not provided, fallback to message_id as the thread root
+        if not true_thread_id:
+            true_thread_id = message_id
+        if not true_conv_id:
+            true_conv_id = message_id
+            
         true_index = None
         
         try:
             logger.info("Attempting to retrieve sent message metadata from Sent Items folder")
-            sent_meta = await self.graph_client.get_sent_message_metadata(
-                access_token=access_token,
+            sent_meta = await provider.get_sent_metadata(
+                org_id=request.organization_id,
                 subject=request.subject,
-                to_email=request.customer_email
+                to_email=request.customer_email,
+                db_session=self.session
             )
             if sent_meta.get("retrieval_success"):
                 true_msg_id = sent_meta.get("id") or true_msg_id

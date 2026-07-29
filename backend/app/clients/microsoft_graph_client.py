@@ -23,7 +23,14 @@ logger = get_logger(__name__)
 
 class MicrosoftGraphClient:
     async def send_email(
-        self, access_token: str, subject: str, html_content: str, to_email: str, attachments: list = None
+        self,
+        access_token: str,
+        subject: str,
+        html_content: str,
+        to_email: str,
+        cc_emails: list = None,
+        bcc_emails: list = None,
+        attachments: list = None
     ) -> str:
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -47,6 +54,16 @@ class MicrosoftGraphClient:
             },
             "saveToSentItems": True
         }
+
+        if cc_emails:
+            payload["message"]["ccRecipients"] = [
+                {"emailAddress": {"address": str(email)}} for email in cc_emails
+            ]
+
+        if bcc_emails:
+            payload["message"]["bccRecipients"] = [
+                {"emailAddress": {"address": str(email)}} for email in bcc_emails
+            ]
 
         if attachments:
             payload["message"]["attachments"] = attachments
@@ -293,9 +310,16 @@ class MicrosoftGraphClient:
             logger.error("Failed to create Graph reply draft", status_code=res.status_code, text=res.text)
             raise GraphApiError(f"Graph API createReply error {res.status_code}: {res.text}")
 
-    async def update_message_draft(self, access_token: str, draft_id: str, html_content: str, cc_emails: list = None) -> None:
+    async def update_message_draft(
+        self,
+        access_token: str,
+        draft_id: str,
+        html_content: str,
+        cc_emails: list = None,
+        bcc_emails: list = None
+    ) -> None:
         """
-        Updates a draft message's body content and CC recipients list.
+        Updates a draft message's body content and CC/BCC recipients list.
         """
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -312,6 +336,10 @@ class MicrosoftGraphClient:
         if cc_emails:
             payload["ccRecipients"] = [
                 {"emailAddress": {"address": str(email)}} for email in cc_emails
+            ]
+        if bcc_emails:
+            payload["bccRecipients"] = [
+                {"emailAddress": {"address": str(email)}} for email in bcc_emails
             ]
             
         async with httpx.AsyncClient(timeout=15.0) as client:

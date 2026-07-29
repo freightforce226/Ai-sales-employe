@@ -11,7 +11,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, model_validato
 
 class AttachmentItem(BaseModel):
     id: UUID4
-    storage_path: str
+    storage_path: Optional[str] = None
     filename: Optional[str] = None
     content_type: Optional[str] = None
     file_size: Optional[int] = None
@@ -25,6 +25,8 @@ class EmailRequest(BaseModel):
     body: Optional[str] = Field(None, description="Legacy fallback body")
     html_body: Optional[str] = Field(None, description="HTML body content")
     plain_text_body: Optional[str] = Field(None, description="Plain text fallback body")
+    cc_emails: List[EmailStr] = Field(default_factory=list, description="Array of CC recipient email addresses")
+    bcc_emails: List[EmailStr] = Field(default_factory=list, description="Array of BCC recipient email addresses")
     attachments: List[AttachmentItem] = Field(default_factory=list, description="Array of attachment metadata objects")
     strict_attachment_mode: bool = Field(False, description="Fail entire email if any attachment download fails")
     template_id: Optional[UUID4] = Field(None, description="The ID of the template used (for multi-tenant checks)")

@@ -246,10 +246,104 @@ async def run_organization_settings_migrations():
             await session.rollback()
             logger.error("Failed to seed default settings for organizations", error=str(e))
 
+        # 4. Idempotently backfill legacy default_cc_emails into organization_settings.cc_emails if empty
+        try:
+            await session.execute(text("""
+                UPDATE organization_settings os
+                SET cc_emails = ARRAY(
+                    SELECT jsonb_array_elements_text(oas.default_cc_emails)
+                    FROM organization_ai_settings oas
+                    WHERE oas.organization_id = os.organization_id
+                )
+                WHERE (os.cc_emails IS NULL OR os.cc_emails = '{}')
+                  AND EXISTS (
+                      SELECT 1 FROM organization_ai_settings oas
+                      WHERE oas.organization_id = os.organization_id
+                        AND oas.default_cc_emails IS NOT NULL
+                        AND oas.default_cc_emails != '[]'::jsonb
+                  )
+            """))
+            await session.commit()
+            logger.info("Idempotently backfilled legacy default CC emails to organization_settings")
+        except Exception as e:
+            await session.rollback()
+            logger.warning("Idempotent legacy default CC backfill warning/skipped", error=str(e))
+
+
+async def run_smtp_migrations():
+    """
+    Executes migrations to add SMTP/IMAP configurations and auth_username,
+    and make existing Microsoft oauth columns nullable on tenant_integrations.
+    """
+    logger.info("Starting database schema migrations for SMTP/IMAP integration...")
+    async with AsyncSessionLocal() as session:
+        # 1. Update IntegrationProvider enum values
+        try:
+            # PostgreSQL command to add enum value if not exists
+            await session.execute(text("ALTER TYPE integration_provider ADD VALUE IF NOT EXISTS 'smtp'"))
+            await session.commit()
+            logger.info("Verified integration_provider enum contains 'smtp'")
+        except Exception as enum_err:
+            await session.rollback()
+            logger.warning("Alter enum integration_provider returned", error=str(enum_err))
+
+        # 2. Modify existing oauth columns to be nullable
+        try:
+            await session.execute(text("ALTER TABLE tenant_integrations ALTER COLUMN encrypted_access_token DROP NOT NULL"))
+            await session.execute(text("ALTER TABLE tenant_integrations ALTER COLUMN encrypted_refresh_token DROP NOT NULL"))
+            await session.execute(text("ALTER TABLE tenant_integrations ALTER COLUMN token_expires_at DROP NOT NULL"))
+            await session.commit()
+            logger.info("OAuth columns are now nullable in tenant_integrations table")
+        except Exception as null_err:
+            await session.rollback()
+            logger.error("Failed to alter token columns to nullable", error=str(null_err))
+
+        # 3. Add SMTP/IMAP settings columns
+        columns_to_add = [
+            ("auth_username", "VARCHAR"),
+            ("encrypted_password", "VARCHAR"),
+            ("smtp_host", "VARCHAR"),
+            ("smtp_port", "INTEGER"),
+            ("smtp_security", "VARCHAR"),
+            ("imap_host", "VARCHAR"),
+            ("imap_port", "INTEGER"),
+            ("imap_security", "VARCHAR"),
+            ("last_sync_cursor", "VARCHAR")
+        ]
+        for col_name, col_type in columns_to_add:
+            try:
+                await session.execute(text(f"ALTER TABLE tenant_integrations ADD COLUMN IF NOT EXISTS {col_name} {col_type} NULL"))
+                await session.commit()
+                logger.info(f"Verified column: {col_name} ({col_type}) exists in tenant_integrations")
+            except Exception as col_err:
+                await session.rollback()
+                logger.error(f"Failed to add column {col_name} ({col_type})", error=str(col_err))
+
+        # 4. Recreate active_organizations_for_engagement view to support both microsoft_graph and smtp
+        try:
+            await session.execute(text("""
+                CREATE OR REPLACE VIEW public.active_organizations_for_engagement AS
+                 SELECT o.id AS organization_id,
+                    o.name,
+                    ti.mailbox_email,
+                    ti.token_expires_at
+                   FROM organizations o
+                   JOIN tenant_integrations ti ON ti.organization_id = o.id 
+                     AND ti.provider IN ('microsoft_graph'::integration_provider, 'smtp'::integration_provider) 
+                     AND ti.is_active = true
+                  WHERE o.is_active = true;
+            """))
+            await session.commit()
+            logger.info("Successfully updated active_organizations_for_engagement view to be provider-agnostic.")
+        except Exception as view_err:
+            await session.rollback()
+            logger.error("Failed to update active_organizations_for_engagement view", error=str(view_err))
+
 
 if __name__ == "__main__":
     async def main():
         await run_engagement_migrations()
         await run_ai_reply_migrations()
         await run_organization_settings_migrations()
+        await run_smtp_migrations()
     asyncio.run(main())

@@ -100,6 +100,131 @@ export default function SettingsPage() {
   const [ccInput, setCcInput] = useState('');
   const [bccInput, setBccInput] = useState('');
 
+  // Provider states
+  const [selectedProvider, setSelectedProvider] = useState<'microsoft_graph' | 'smtp'>('microsoft_graph');
+  const [presets, setPresets] = useState<any>({});
+  const [selectedPreset, setSelectedPreset] = useState('custom');
+  
+  // SMTP Config states
+  const [mailboxEmail, setMailboxEmail] = useState('');
+  const [authUsername, setAuthUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [smtpHost, setSmtpHost] = useState('');
+  const [smtpPort, setSmtpPort] = useState('');
+  const [smtpSecurity, setSmtpSecurity] = useState('ssl_tls');
+  const [imapHost, setImapHost] = useState('');
+  const [imapPort, setImapPort] = useState('');
+  const [imapSecurity, setImapSecurity] = useState('ssl_tls');
+  
+  // SMTP helper/status states
+  const [testSuccess, setTestSuccess] = useState(false);
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [savingSmtp, setSavingSmtp] = useState(false);
+  const [smtpError, setSmtpError] = useState<string | null>(null);
+  const [smtpSuccess, setSmtpSuccess] = useState<string | null>(null);
+
+  const fetchPresets = async () => {
+    try {
+      const res = await api.get('/api/v1/smtp/presets');
+      setPresets(res.data);
+    } catch (err) {
+      console.error('Failed to fetch presets', err);
+    }
+  };
+
+  useEffect(() => {
+    if (isTenantInitialized) {
+      fetchPresets();
+    }
+  }, [isTenantInitialized]);
+
+  const handlePresetChange = (presetKey: string) => {
+    setSelectedPreset(presetKey);
+    setTestSuccess(false);
+    if (presetKey === 'custom') return;
+    const preset = presets[presetKey];
+    if (preset) {
+      setSmtpHost(preset.smtp_host || '');
+      setSmtpPort(preset.smtp_port ? String(preset.smtp_port) : '');
+      setSmtpSecurity(preset.smtp_security || 'ssl_tls');
+      setImapHost(preset.imap_host || '');
+      setImapPort(preset.imap_port ? String(preset.imap_port) : '');
+      setImapSecurity(preset.imap_security || 'ssl_tls');
+    }
+  };
+
+  const onFieldChange = (setter: (val: string) => void, val: string) => {
+    setter(val);
+    setTestSuccess(false);
+  };
+
+  const handleTestSmtp = async () => {
+    try {
+      setTestingConnection(true);
+      setSmtpError(null);
+      setSmtpSuccess(null);
+      await api.post('/api/v1/smtp/test', {
+        mailbox_email: mailboxEmail,
+        auth_username: authUsername || null,
+        password: password,
+        smtp_host: smtpHost,
+        smtp_port: parseInt(smtpPort),
+        smtp_security: smtpSecurity,
+        imap_host: imapHost,
+        imap_port: parseInt(imapPort),
+        imap_security: imapSecurity,
+        send_test_email: false
+      });
+      setTestSuccess(true);
+      setSmtpSuccess('Connection tested and validated successfully!');
+    } catch (err: any) {
+      console.error('SMTP test failed', err);
+      setSmtpError(err?.response?.data?.detail || 'SMTP/IMAP validation failed. Please check settings.');
+      setTestSuccess(false);
+    } finally {
+      setTestingConnection(false);
+    }
+  };
+
+  const handleConnectSmtp = async () => {
+    if (!testSuccess) return;
+    try {
+      setSavingSmtp(true);
+      setSmtpError(null);
+      setSmtpSuccess(null);
+      await api.post('/api/v1/smtp/connect', {
+        mailbox_email: mailboxEmail,
+        auth_username: authUsername || null,
+        password: password,
+        smtp_host: smtpHost,
+        smtp_port: parseInt(smtpPort),
+        smtp_security: smtpSecurity,
+        imap_host: imapHost,
+        imap_port: parseInt(imapPort),
+        imap_security: imapSecurity
+      });
+      setSmtpSuccess('SMTP/IMAP integrated and saved successfully!');
+      setTestSuccess(false);
+      await fetchSettings();
+    } catch (err: any) {
+      console.error('SMTP connect failed', err);
+      setSmtpError(err?.response?.data?.detail || 'Failed to save SMTP integration.');
+    } finally {
+      setSavingSmtp(false);
+    }
+  };
+
+  const handleDisconnectSmtp = async () => {
+    if (!confirm('Are you sure you want to disconnect SMTP/IMAP integration?')) return;
+    try {
+      await api.delete('/api/v1/smtp/disconnect');
+      await fetchSettings();
+    } catch (err) {
+      console.error('Failed to disconnect SMTP', err);
+      alert('Could not disconnect SMTP integration.');
+    }
+  };
+
   const fetchSettings = async () => {
     try {
       setLoading(true);
@@ -111,6 +236,21 @@ export default function SettingsPage() {
       setOutlook(res.data.outlook);
       setSystem(res.data.system);
       setIsAdmin(res.data.is_admin);
+
+      const outlookData = res.data.outlook;
+      if (outlookData) {
+        setSelectedProvider(outlookData.provider || 'microsoft_graph');
+        if (outlookData.provider === 'smtp') {
+          setMailboxEmail(outlookData.connected_account || '');
+          setSmtpHost(outlookData.smtp_host || '');
+          setSmtpPort(outlookData.smtp_port ? String(outlookData.smtp_port) : '');
+          setSmtpSecurity(outlookData.smtp_security || 'ssl_tls');
+          setImapHost(outlookData.imap_host || '');
+          setImapPort(outlookData.imap_port ? String(outlookData.imap_port) : '');
+          setImapSecurity(outlookData.imap_security || 'ssl_tls');
+          setPassword('__UNCHANGED__');
+        }
+      }
 
       const serialized = JSON.stringify({
         profile: res.data.profile,
@@ -729,7 +869,7 @@ export default function SettingsPage() {
                 )}
               </Card>
 
-              {/* SECTION 6: Outlook Connection */}
+              {/* SECTION 6: Email Integration Settings */}
               <Card padding="none" className="overflow-hidden border border-border-color">
                 <div 
                   onClick={() => toggleSection('outlook')}
@@ -737,54 +877,268 @@ export default function SettingsPage() {
                 >
                   <div className="flex items-center gap-3">
                     <RefreshCw className="w-4.5 h-4.5 text-text-secondary" />
-                    <span className="text-sm font-bold text-text-primary">Outlook Connection Status</span>
+                    <span className="text-sm font-bold text-text-primary">Email Integration Settings</span>
                   </div>
                   {expandedSections.outlook ? <ChevronUp className="w-4 h-4 text-text-muted" /> : <ChevronDown className="w-4 h-4 text-text-muted" />}
                 </div>
 
                 {expandedSections.outlook && outlook && (
-                  <div className="p-6 space-y-4 text-xs">
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-text-secondary">Connection Status:</span>
-                          <Badge variant={outlook.connected ? 'success' : 'danger'}>
-                            {outlook.connected ? 'Connected' : 'Not Connected'}
-                          </Badge>
-                        </div>
-                        {outlook.connected && (
+                  <div className="p-6 space-y-6 text-xs">
+                    {/* Active Integration Status */}
+                    <div className="p-4 bg-bg-secondary/20 border border-border-color/40 rounded-xl space-y-2">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-text-secondary">Current Active Integration:</span>
+                        <Badge variant={outlook.connected ? 'success' : 'danger'}>
+                          {outlook.connected ? (outlook.provider === 'smtp' ? 'SMTP/IMAP' : 'Microsoft 365') : 'No Active Integration'}
+                        </Badge>
+                      </div>
+                      {outlook.connected && (
+                        <>
                           <p className="text-text-secondary">
                             Account: <span className="font-semibold text-text-primary">{outlook.connected_account}</span>
                           </p>
-                        )}
-                        {outlook.connected && (
                           <p className="text-[10px] text-text-muted">
-                            Last Sync: {formatDate(outlook.last_sync)}
+                            Last Sync/Activity: {formatDate(outlook.last_sync)}
                           </p>
+                        </>
+                      )}
+                    </div>
+
+                    {/* Provider Selector */}
+                    {isAdmin && (
+                      <div className="flex gap-4 border-b border-border-color/50 pb-4">
+                        <button
+                          type="button"
+                          onClick={() => setSelectedProvider('microsoft_graph')}
+                          className={`px-4 py-2 text-xs font-bold rounded-lg transition-colors ${
+                            selectedProvider === 'microsoft_graph'
+                              ? 'bg-brand-primary text-white'
+                              : 'bg-bg-secondary text-text-secondary hover:bg-bg-secondary/80'
+                          }`}
+                        >
+                          Microsoft 365 (OAuth)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedProvider('smtp')}
+                          className={`px-4 py-2 text-xs font-bold rounded-lg transition-colors ${
+                            selectedProvider === 'smtp'
+                              ? 'bg-brand-primary text-white'
+                              : 'bg-bg-secondary text-text-secondary hover:bg-bg-secondary/80'
+                          }`}
+                        >
+                          SMTP / IMAP
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Microsoft 365 Integration Block */}
+                    {selectedProvider === 'microsoft_graph' && (
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-2">
+                        <div className="space-y-1">
+                          <p className="font-bold text-text-secondary">Microsoft 365 (via Outlook REST API)</p>
+                          <p className="text-[10px] text-text-muted">Connect your corporate email mailbox securely via OAuth authorization.</p>
+                        </div>
+                        {isAdmin && (
+                          <div className="flex gap-2">
+                            <Button 
+                              variant={outlook.connected && outlook.provider === 'microsoft_graph' ? 'secondary' : 'primary'} 
+                              size="sm" 
+                              onClick={handleReconnectOutlook}
+                            >
+                              {outlook.connected && outlook.provider === 'microsoft_graph' ? 'Reconnect' : 'Connect Account'}
+                            </Button>
+                            {outlook.connected && outlook.provider === 'microsoft_graph' && (
+                              <Button 
+                                variant="danger" 
+                                size="sm" 
+                                onClick={handleDisconnectOutlook}
+                              >
+                                Disconnect
+                              </Button>
+                            )}
+                          </div>
                         )}
                       </div>
+                    )}
 
-                      {isAdmin && (
-                        <div className="flex gap-2">
-                          <Button 
-                            variant={outlook.connected ? 'secondary' : 'primary'} 
-                            size="sm" 
-                            onClick={handleReconnectOutlook}
-                          >
-                            {outlook.connected ? 'Reconnect' : 'Connect Account'}
-                          </Button>
-                          {outlook.connected && (
+                    {/* SMTP/IMAP Manual Form Block */}
+                    {selectedProvider === 'smtp' && (
+                      <div className="space-y-4 pt-2">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-border-color/30 pb-4">
+                          <div className="space-y-1">
+                            <p className="font-bold text-text-secondary">SMTP & IMAP Mail Server</p>
+                            <p className="text-[10px] text-text-muted">Configure outbound and inbound mail server settings manually or use a provider preset.</p>
+                          </div>
+                          {outlook.connected && outlook.provider === 'smtp' && isAdmin && (
                             <Button 
                               variant="danger" 
                               size="sm" 
-                              onClick={handleDisconnectOutlook}
+                              onClick={handleDisconnectSmtp}
                             >
-                              Disconnect
+                              Disconnect SMTP/IMAP
                             </Button>
                           )}
                         </div>
-                      )}
-                    </div>
+
+                        {isAdmin && (
+                          <div className="space-y-4">
+                            {/* Preset Selector */}
+                            <div className="space-y-1.5">
+                              <label className="font-bold text-text-secondary">Choose Provider Preset</label>
+                              <select
+                                value={selectedPreset}
+                                onChange={(e) => handlePresetChange(e.target.value)}
+                                className="w-full rounded-lg border border-border-color bg-bg-surface px-3 py-2 text-xs text-text-primary focus:border-brand-primary focus:outline-none font-bold text-text-secondary"
+                              >
+                                <option value="custom">Custom (SMTP/IMAP)</option>
+                                {Object.keys(presets).map((key) => (
+                                  <option key={key} value={key}>
+                                    {presets[key].name}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            {/* Credentials */}
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                              <div className="space-y-1.5">
+                                <label className="font-bold text-text-secondary">Mailbox Email</label>
+                                <Input
+                                  type="email"
+                                  placeholder="sales@company.com"
+                                  value={mailboxEmail}
+                                  onChange={(e) => onFieldChange(setMailboxEmail, e.target.value)}
+                                />
+                              </div>
+                              <div className="space-y-1.5">
+                                <label className="font-bold text-text-secondary">Auth Username (Optional)</label>
+                                <Input
+                                  type="text"
+                                  placeholder="Defaults to mailbox email"
+                                  value={authUsername}
+                                  onChange={(e) => onFieldChange(setAuthUsername, e.target.value)}
+                                />
+                              </div>
+                            </div>
+
+                            <div className="space-y-1.5">
+                              <label className="font-bold text-text-secondary">Password</label>
+                              <Input
+                                type="password"
+                                placeholder={password === '__UNCHANGED__' ? '•••••••• (Password Saved)' : 'Enter password'}
+                                value={password === '__UNCHANGED__' ? '' : password}
+                                onChange={(e) => onFieldChange(setPassword, e.target.value)}
+                              />
+                            </div>
+
+                            {/* Server Configurations */}
+                            <div className="border-t border-border-color/30 pt-4 space-y-4">
+                              <p className="font-bold text-text-secondary">Outgoing Server (SMTP)</p>
+                              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                <div className="space-y-1.5">
+                                  <label className="font-bold text-text-secondary">SMTP Host</label>
+                                  <Input
+                                    type="text"
+                                    placeholder="smtp.domain.com"
+                                    value={smtpHost}
+                                    onChange={(e) => onFieldChange(setSmtpHost, e.target.value)}
+                                  />
+                                </div>
+                                <div className="space-y-1.5">
+                                  <label className="font-bold text-text-secondary">SMTP Port</label>
+                                  <Input
+                                    type="text"
+                                    placeholder="465"
+                                    value={smtpPort}
+                                    onChange={(e) => onFieldChange(setSmtpPort, e.target.value)}
+                                  />
+                                </div>
+                                <div className="space-y-1.5">
+                                  <label className="font-bold text-text-secondary">SMTP Security</label>
+                                  <select
+                                    value={smtpSecurity}
+                                    onChange={(e) => onFieldChange(setSmtpSecurity, e.target.value)}
+                                    className="w-full rounded-lg border border-border-color bg-bg-surface px-3 py-2 text-xs text-text-primary focus:border-brand-primary focus:outline-none font-bold text-text-secondary"
+                                  >
+                                    <option value="ssl_tls">SSL / TLS</option>
+                                    <option value="starttls">STARTTLS</option>
+                                    <option value="none">None (Plaintext)</option>
+                                  </select>
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="border-t border-border-color/30 pt-4 space-y-4">
+                              <p className="font-bold text-text-secondary">Incoming Server (IMAP)</p>
+                              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                <div className="space-y-1.5">
+                                  <label className="font-bold text-text-secondary">IMAP Host</label>
+                                  <Input
+                                    type="text"
+                                    placeholder="imap.domain.com"
+                                    value={imapHost}
+                                    onChange={(e) => onFieldChange(setImapHost, e.target.value)}
+                                  />
+                                </div>
+                                <div className="space-y-1.5">
+                                  <label className="font-bold text-text-secondary">IMAP Port</label>
+                                  <Input
+                                    type="text"
+                                    placeholder="993"
+                                    value={imapPort}
+                                    onChange={(e) => onFieldChange(setImapPort, e.target.value)}
+                                  />
+                                </div>
+                                <div className="space-y-1.5">
+                                  <label className="font-bold text-text-secondary">IMAP Security</label>
+                                  <select
+                                    value={imapSecurity}
+                                    onChange={(e) => onFieldChange(setImapSecurity, e.target.value)}
+                                    className="w-full rounded-lg border border-border-color bg-bg-surface px-3 py-2 text-xs text-text-primary focus:border-brand-primary focus:outline-none font-bold text-text-secondary"
+                                  >
+                                    <option value="ssl_tls">SSL / TLS</option>
+                                    <option value="starttls">STARTTLS</option>
+                                    <option value="none">None (Plaintext)</option>
+                                  </select>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Notifications */}
+                            {smtpError && (
+                              <Alert variant="danger" title="Integration Error" description={smtpError} />
+                            )}
+                            {smtpSuccess && (
+                              <Alert variant="success" title="Success" description={smtpSuccess} />
+                            )}
+
+                            {/* SMTP Action Buttons */}
+                            <div className="flex gap-3 pt-2 border-t border-border-color/30">
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                size="sm"
+                                disabled={testingConnection || !mailboxEmail || !smtpHost || !smtpPort || !imapHost || !imapPort || !password}
+                                onClick={handleTestSmtp}
+                              >
+                                {testingConnection ? 'Testing Connection...' : 'Test Connection'}
+                              </Button>
+
+                              <Button
+                                type="button"
+                                variant="primary"
+                                size="sm"
+                                disabled={savingSmtp || !testSuccess}
+                                onClick={handleConnectSmtp}
+                              >
+                                {savingSmtp ? 'Saving Integration...' : 'Save Configuration'}
+                              </Button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
               </Card>

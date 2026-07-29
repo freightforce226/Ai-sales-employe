@@ -4,16 +4,14 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.logging import get_logger
-from app.clients.microsoft_graph_client import MicrosoftGraphClient
-from app.services.token_service import TokenService
+from app.providers import EmailProviderFactory
 
 logger = get_logger(__name__)
 
 class InboundSyncService:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.graph_client = MicrosoftGraphClient()
-        self.token_service = TokenService(db)
+        self.provider_factory = EmailProviderFactory(db)
 
     async def sync_all_active_mailboxes(self, organization_ids: list = None) -> dict:
         """
@@ -88,11 +86,15 @@ class InboundSyncService:
                 """), {"id": integration_id})
                 await self.db.commit()
 
-                # 2. Refresh/Retrieve access token
-                access_token = await self.token_service.get_valid_access_token(org_id)
+                # 2. Resolve provider dynamically via factory
+                provider = await self.provider_factory.get_provider_for_tenant(org_id)
 
-                # 3. Fetch messages using Graph Delta Query
-                delta_res = await self.graph_client.fetch_inbox_messages_delta(access_token, delta_link)
+                # 3. Fetch messages using abstract provider sync capability
+                delta_res = await provider.sync_inbound_emails(
+                    org_id=org_id,
+                    sync_state=delta_link,
+                    db_session=self.db
+                )
                 messages = delta_res.get("messages", [])
                 new_delta_link = delta_res.get("delta_link")
 

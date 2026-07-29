@@ -81,14 +81,26 @@ async def get_settings(
 
     # 3. Fetch Outlook oauth status
     res_out = await db.execute(
-        text("SELECT mailbox_email, is_active, last_refreshed_at FROM tenant_integrations WHERE organization_id = :org_id"),
+        text("""
+            SELECT provider, mailbox_email, is_active, last_refreshed_at, 
+                   smtp_host, smtp_port, smtp_security, imap_host, imap_port, imap_security 
+            FROM tenant_integrations 
+            WHERE organization_id = :org_id
+        """),
         {"org_id": org_id}
     )
     out_row = res_out.fetchone()
     outlook_info = {
         "connected": out_row.is_active if out_row else False,
         "connected_account": out_row.mailbox_email if out_row else None,
-        "last_sync": out_row.last_refreshed_at if out_row else None
+        "last_sync": out_row.last_refreshed_at if out_row else None,
+        "provider": out_row.provider if out_row else "microsoft_graph",
+        "smtp_host": out_row.smtp_host if out_row else None,
+        "smtp_port": out_row.smtp_port if out_row else None,
+        "smtp_security": out_row.smtp_security if out_row else None,
+        "imap_host": out_row.imap_host if out_row else None,
+        "imap_port": out_row.imap_port if out_row else None,
+        "imap_security": out_row.imap_security if out_row else None,
     }
 
     # 4. Map settings fields cleanly

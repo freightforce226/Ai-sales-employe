@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import email, oauth, auth, dashboard, csv_import, customers, templates, attachments, engagement, follow_ups, ai_reply
+from app.api.routes import email, oauth, auth, dashboard, csv_import, customers, templates, attachments, engagement, follow_ups, ai_reply, smtp
 from app.core.config import get_settings
 from app.core.exceptions import (
     EmailSendError,
@@ -48,11 +48,12 @@ async def lifespan(app: FastAPI):
     )
     
     # Initialize DB schemas/tables if missing
-    from app.db.migrations import run_engagement_migrations, run_ai_reply_migrations, run_organization_settings_migrations
+    from app.db.migrations import run_engagement_migrations, run_ai_reply_migrations, run_organization_settings_migrations, run_smtp_migrations
     try:
         await run_engagement_migrations()
         await run_ai_reply_migrations()
         await run_organization_settings_migrations()
+        await run_smtp_migrations()
         from sqlalchemy import text
         from app.db.session import AsyncSessionLocal
         async with AsyncSessionLocal() as session:
@@ -168,8 +169,8 @@ app = FastAPI(
     description="Multi-tenant service for sending emails via Microsoft Graph API",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs" if settings.environment != "production" else None,
-    redoc_url="/redoc" if settings.environment != "production" else None,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 app.add_middleware(
@@ -352,6 +353,7 @@ app.include_router(follow_ups.router, prefix="/api/v1/follow-ups")
 app.include_router(follow_ups.router, prefix="/api/v1/followups")
 app.include_router(ai_reply.router)
 app.include_router(org_settings.router)
+app.include_router(smtp.router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["Health"])
