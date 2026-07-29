@@ -354,6 +354,8 @@ app.include_router(follow_ups.router, prefix="/api/v1/followups")
 app.include_router(ai_reply.router)
 app.include_router(org_settings.router)
 app.include_router(smtp.router, prefix="/api/v1")
+from app.api.routes import debug
+app.include_router(debug.router)
 
 
 @app.get("/health", tags=["Health"])
