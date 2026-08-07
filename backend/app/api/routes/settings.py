@@ -169,6 +169,14 @@ async def update_settings(
 
     org_id = current_user.organization_id
 
+    # Fetch previous value for logging
+    prev_ai_res = await db.execute(
+        text("SELECT ai_enabled FROM organization_settings WHERE organization_id = :org_id"),
+        {"org_id": org_id}
+    )
+    prev_row = prev_ai_res.fetchone()
+    prev_ai_enabled = prev_row[0] if prev_row else False
+
     # Execute updates inside a single database transaction
     try:
         # 1. Update organizations table
@@ -239,7 +247,35 @@ async def update_settings(
             }
         )
 
+        # 3. Synchronize organization_ai_settings.ai_enabled with the incoming payload using UPSERT
+        import json
+        await db.execute(
+            text("""
+                INSERT INTO organization_ai_settings (organization_id, ai_enabled, default_cc_emails)
+                VALUES (:org_id, :ai_enabled, CAST(:default_cc_emails AS JSONB))
+                ON CONFLICT (organization_id)
+                DO UPDATE SET 
+                    ai_enabled = EXCLUDED.ai_enabled,
+                    default_cc_emails = EXCLUDED.default_cc_emails,
+                    updated_at = NOW()
+            """),
+            {
+                "org_id": org_id,
+                "ai_enabled": payload.settings.ai_enabled,
+                "default_cc_emails": json.dumps(payload.settings.cc_emails)
+            }
+        )
+
         await db.commit()
+
+        # Log transition details
+        logger.info(
+            "Synchronized AI settings for organization",
+            organization_id=str(org_id),
+            previous_ai_enabled=prev_ai_enabled,
+            new_ai_enabled=payload.settings.ai_enabled
+        )
+
         return {"success": True}
 
     except Exception as e:

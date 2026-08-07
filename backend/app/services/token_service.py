@@ -18,6 +18,9 @@ from app.repositories.tenant_repository import TenantIntegrationRepository
 logger = get_logger(__name__)
 
 
+import time
+_token_cache = {}
+
 class TokenService:
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -25,6 +28,15 @@ class TokenService:
         self.oauth_client = MicrosoftOAuthClient()
 
     async def get_valid_access_token(self, organization_id: UUID) -> str:
+        org_id_str = str(organization_id)
+        now = time.time()
+        
+        # Check cache: reuse if token is still valid for at least 3 minutes (180 seconds)
+        if org_id_str in _token_cache:
+            cache_entry = _token_cache[org_id_str]
+            if cache_entry["expires_at"] - now > 180:
+                return cache_entry["token"]
+                
         integration = await self.tenant_repo.get_by_organization_id(organization_id)
         
         if not integration:
@@ -62,4 +74,11 @@ class TokenService:
                 await self.tenant_repo.update_error_state(organization_id, "Failed to refresh token: " + str(e))
                 raise ValueError("Failed to obtain valid access token")
                 
-        return decrypt_token(integration.encrypted_access_token)
+        decrypted_token = decrypt_token(integration.encrypted_access_token)
+        expires_at_timestamp = integration.token_expires_at.replace(tzinfo=timezone.utc).timestamp()
+        
+        _token_cache[org_id_str] = {
+            "token": decrypted_token,
+            "expires_at": expires_at_timestamp
+        }
+        return decrypted_token

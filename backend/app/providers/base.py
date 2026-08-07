@@ -12,6 +12,8 @@ async def run_blocking_operation(func: Callable[..., Any], *args: Any, **kwargs:
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+from app.schemas.inbound_message import InboundSyncResult
+
 class BaseEmailProvider(ABC):
     @abstractmethod
     async def send_email(
@@ -23,7 +25,8 @@ class BaseEmailProvider(ABC):
         cc_emails: List[str],
         bcc_emails: List[str],
         attachments: List[Dict[str, Any]],
-        db_session: AsyncSession
+        db_session: AsyncSession,
+        sender_display_name: Optional[str] = None
     ) -> str:
         """
         Sends a standard outbound email and returns the message ID.
@@ -39,7 +42,8 @@ class BaseEmailProvider(ABC):
         cc_emails: List[str],
         bcc_emails: List[str],
         attachments: List[Dict[str, Any]],
-        db_session: AsyncSession
+        db_session: AsyncSession,
+        sender_display_name: Optional[str] = None
     ) -> str:
         """
         Sends a reply threaded under a parent message.
@@ -65,7 +69,7 @@ class BaseEmailProvider(ABC):
         org_id: UUID,
         sync_state: Optional[str],
         db_session: AsyncSession
-    ) -> Dict[str, Any]:
+    ) -> InboundSyncResult:
         """
         Polls new inbox emails using a generic sync state token.
         """

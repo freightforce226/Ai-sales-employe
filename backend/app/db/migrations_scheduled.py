@@ -197,10 +197,12 @@ async def run_scheduled_migrations():
                   v_has_replied boolean;
                   v_sent_at timestamp with time zone;
                   v_base_time timestamp with time zone;
+                  v_timezone text;
+                  v_pref_send_time text;
                 BEGIN
-                  -- 1. Fetch Follow-up Settings
-                  SELECT max_follow_ups, stop_on_reply, follow_up_sequence_config
-                  INTO v_max_follow_ups, v_stop_on_reply, v_config
+                  -- 1. Fetch Follow-up & Timezone Settings
+                  SELECT max_follow_ups, stop_on_reply, follow_up_sequence_config, timezone, preferred_send_time
+                  INTO v_max_follow_ups, v_stop_on_reply, v_config, v_timezone, v_pref_send_time
                   FROM organization_engagement_settings
                   WHERE organization_id = p_organization_id;
 
@@ -291,6 +293,15 @@ async def run_scheduled_migrations():
 
                   v_scheduled_datetime := v_base_time + (v_delay_days * interval '1 day');
                   v_scheduled_date := v_scheduled_datetime::date;
+
+                  -- Adjust to Organization's local preferred Send Time, converted to UTC
+                  BEGIN
+                      v_scheduled_datetime := (v_scheduled_date::text || ' ' || COALESCE(v_pref_send_time, '09:00'))::timestamp AT TIME ZONE COALESCE(v_timezone, 'UTC');
+                  EXCEPTION WHEN OTHERS THEN
+                      -- Fallback if conversion fails
+                      v_scheduled_datetime := v_base_time + (v_delay_days * interval '1 day');
+                  END;
+
                   v_followup_id := gen_random_uuid();
 
                   -- 6. Insert new follow-up step
@@ -433,6 +444,197 @@ async def run_scheduled_migrations():
                 ADD COLUMN IF NOT EXISTS last_graph_delta_link TEXT;
             """))
             logger.info("Successfully added tracking columns to tenant_integrations.")
+
+            # Create partial unique indexes to guarantee single active execution per organization
+            await session.execute(text("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_active_engagement_execution 
+                ON public.engagement_executions (organization_id) 
+                WHERE status IN ('pending', 'started', 'running');
+            """))
+            await session.execute(text("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_active_followup_execution 
+                ON public.follow_up_executions (organization_id) 
+                WHERE status IN ('pending', 'started', 'running');
+            """))
+            logger.info("Successfully deployed partial unique constraints.")
+
+            # Create start_engagement_execution stored procedure
+            await session.execute(text("""
+                CREATE OR REPLACE FUNCTION public.start_engagement_execution(
+                    p_organization_id UUID,
+                    p_workflow_execution_id TEXT,
+                    p_trigger_type TEXT,
+                    p_started_by_user UUID,
+                    p_timeout_hours INTEGER DEFAULT 2
+                )
+                RETURNS TABLE (
+                    already_running BOOLEAN,
+                    execution_id UUID,
+                    workflow_execution_id TEXT,
+                    status TEXT,
+                    started_at TIMESTAMP WITH TIME ZONE,
+                    total_customers INTEGER
+                ) AS $func$
+                #variable_conflict use_column
+                DECLARE
+                    v_existing_id UUID;
+                    v_existing_workflow_id TEXT;
+                    v_existing_status TEXT;
+                    v_existing_started_at TIMESTAMP WITH TIME ZONE;
+                    v_existing_total_customers INTEGER;
+                    v_new_id UUID;
+                    v_new_started_at TIMESTAMP WITH TIME ZONE;
+                    v_total_eligible INTEGER;
+                    v_weekly_cap INTEGER;
+                    v_min_gap INTEGER;
+                    v_batch_limit INTEGER;
+                BEGIN
+                    -- Acquire transactional advisory lock on organization to prevent race conditions
+                    PERFORM pg_advisory_xact_lock(hashtext(p_organization_id::text));
+
+                    -- Clean up stale executions
+                    UPDATE public.engagement_executions
+                    SET status = 'failed',
+                        error_message = 'Execution timed out after ' || p_timeout_hours || ' hours in started/running/pending state.',
+                        completed_at = NOW()
+                    WHERE organization_id = p_organization_id
+                       AND status IN ('pending', 'started', 'running')
+                       AND started_at < (NOW() - (p_timeout_hours || ' hours')::INTERVAL);
+
+                    -- Check for active execution
+                    SELECT id, public.engagement_executions.workflow_execution_id, status, public.engagement_executions.started_at, total_customers
+                    INTO v_existing_id, v_existing_workflow_id, v_existing_status, v_existing_started_at, v_existing_total_customers
+                    FROM public.engagement_executions
+                    WHERE organization_id = p_organization_id
+                      AND status IN ('pending', 'started', 'running')
+                    ORDER BY started_at DESC
+                    LIMIT 1;
+
+                    IF FOUND THEN
+                         RETURN QUERY SELECT TRUE, v_existing_id, v_existing_workflow_id, v_existing_status, v_existing_started_at, v_existing_total_customers;
+                         RETURN;
+                    END IF;
+
+                    -- Retrieve settings for total customers count
+                    SELECT emails_per_week, min_gap_days, batch_size
+                    INTO v_weekly_cap, v_min_gap, v_batch_limit
+                    FROM public.organization_engagement_settings
+                    WHERE organization_id = p_organization_id;
+
+                    IF NOT FOUND THEN
+                         v_weekly_cap := 3;
+                         v_min_gap := 2;
+                         v_batch_limit := 50;
+                    END IF;
+
+                    -- Calculate eligible customer count
+                    SELECT COUNT(*)::INTEGER
+                    INTO v_total_eligible
+                    FROM public.get_engagement_eligible_customers(
+                         p_organization_id := p_organization_id,
+                         p_week_start := date_trunc('week', NOW())::date,
+                         p_weekly_cap := v_weekly_cap,
+                         p_min_gap_days := v_min_gap,
+                         p_batch_limit := v_batch_limit,
+                         p_batch_offset := 0
+                    );
+
+                    v_new_id := gen_random_uuid();
+                    v_new_started_at := NOW();
+
+                    INSERT INTO public.engagement_executions (
+                        id, organization_id, workflow_execution_id, started_by_user, trigger_type, status,
+                        total_customers, processed, sent, failed, skipped, started_at
+                    ) VALUES (
+                        v_new_id, p_organization_id, p_workflow_execution_id, p_started_by_user, p_trigger_type, 'started',
+                        v_total_eligible, 0, 0, 0, 0, v_new_started_at
+                    );
+
+                    RETURN QUERY SELECT FALSE, v_new_id, p_workflow_execution_id, 'started'::TEXT, v_new_started_at, v_total_eligible;
+                END;
+                $func$ LANGUAGE plpgsql;
+            """))
+
+            # Create start_followup_execution stored procedure
+            await session.execute(text("""
+                CREATE OR REPLACE FUNCTION public.start_followup_execution(
+                    p_organization_id UUID,
+                    p_workflow_execution_id TEXT,
+                    p_trigger_type TEXT,
+                    p_started_by_user UUID,
+                    p_timeout_hours INTEGER DEFAULT 2
+                )
+                RETURNS TABLE (
+                    already_running BOOLEAN,
+                    execution_id UUID,
+                    workflow_execution_id TEXT,
+                    status TEXT,
+                    started_at TIMESTAMP WITH TIME ZONE,
+                    total_customers INTEGER
+                ) AS $func$
+                #variable_conflict use_column
+                DECLARE
+                    v_existing_id UUID;
+                    v_existing_workflow_id TEXT;
+                    v_existing_status TEXT;
+                    v_existing_started_at TIMESTAMP WITH TIME ZONE;
+                    v_existing_total_customers INTEGER;
+                    v_new_id UUID;
+                    v_new_started_at TIMESTAMP WITH TIME ZONE;
+                    v_total_eligible INTEGER;
+                BEGIN
+                    -- Acquire transactional advisory lock on organization to prevent race conditions
+                    PERFORM pg_advisory_xact_lock(hashtext(p_organization_id::text));
+
+                    -- Clean up stale executions
+                    UPDATE public.follow_up_executions
+                    SET status = 'failed',
+                        error_message = 'Execution timed out after ' || p_timeout_hours || ' hours in started/running/pending state.',
+                        completed_at = NOW()
+                    WHERE organization_id = p_organization_id
+                      AND status IN ('pending', 'started', 'running')
+                      AND started_at < (NOW() - (p_timeout_hours || ' hours')::INTERVAL);
+
+                    -- Check for active execution
+                    SELECT id, public.follow_up_executions.workflow_execution_id, status, public.follow_up_executions.started_at, total_customers
+                    INTO v_existing_id, v_existing_workflow_id, v_existing_status, v_existing_started_at, v_existing_total_customers
+                    FROM public.follow_up_executions
+                    WHERE organization_id = p_organization_id
+                      AND status IN ('pending', 'started', 'running')
+                    ORDER BY started_at DESC
+                    LIMIT 1;
+
+                    IF FOUND THEN
+                         RETURN QUERY SELECT TRUE, v_existing_id, v_existing_workflow_id, v_existing_status, v_existing_started_at, v_existing_total_customers;
+                         RETURN;
+                    END IF;
+
+                    -- Calculate due followups count
+                    SELECT COUNT(*)::INTEGER
+                    INTO v_total_eligible
+                    FROM public.follow_up_schedule f
+                    JOIN public.customers c ON f.customer_id = c.id
+                    WHERE f.organization_id = p_organization_id 
+                      AND f.draft_status = 'scheduled'
+                      AND f.scheduled_datetime <= NOW()
+                      AND c.deleted_at IS NULL;
+
+                    v_new_id := gen_random_uuid();
+                    v_new_started_at := NOW();
+
+                    INSERT INTO public.follow_up_executions (
+                        id, organization_id, workflow_execution_id, started_by_user, trigger_type, status,
+                        total_customers, processed, sent, failed, skipped, started_at
+                    ) VALUES (
+                        v_new_id, p_organization_id, p_workflow_execution_id, p_started_by_user, p_trigger_type, 'started',
+                        v_total_eligible, 0, 0, 0, 0, v_new_started_at
+                    );
+
+                    RETURN QUERY SELECT FALSE, v_new_id, p_workflow_execution_id, 'started'::TEXT, v_new_started_at, v_total_eligible;
+                END;
+                $func$ LANGUAGE plpgsql;
+            """))
+            logger.info("Successfully deployed start execution stored procedures.")
 
             await session.commit()
             

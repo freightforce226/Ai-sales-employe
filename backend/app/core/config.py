@@ -40,6 +40,7 @@ class Settings(BaseSettings):
 
     ai_reply_recovery_interval_minutes: int = 5
     ai_reply_lock_timeout_minutes: int = 15
+    smtp_debug_logging: bool = False
 
     @property
     def allowed_origins_list(self) -> list[str]:

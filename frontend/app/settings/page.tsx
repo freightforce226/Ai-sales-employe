@@ -38,6 +38,7 @@ interface ProfileData {
 }
 
 interface SettingsData {
+  sender_display_name: string | null;
   cc_emails: string[];
   bcc_emails: string[];
   ai_enabled: boolean;
@@ -56,6 +57,7 @@ interface OutlookData {
   connected: boolean;
   connected_account: string | null;
   last_sync: string | null;
+  provider?: string;
 }
 
 interface SystemData {
@@ -998,6 +1000,18 @@ export default function SettingsPage() {
                                   </option>
                                 ))}
                               </select>
+                            </div>
+
+                            {/* Sender Display Name */}
+                            <div className="space-y-1.5">
+                              <label className="font-bold text-text-secondary">Sender Display Name</label>
+                              <Input
+                                type="text"
+                                placeholder="e.g. Rahul, Logistics Team"
+                                value={settings?.sender_display_name || ''}
+                                onChange={(e) => handleSettingsChange('sender_display_name', e.target.value)}
+                                disabled={!isAdmin}
+                              />
                             </div>
 
                             {/* Credentials */}

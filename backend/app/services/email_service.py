@@ -23,6 +23,12 @@ settings = get_settings()
 _attachment_cache = {}
 CACHE_TTL_SECONDS = 300
 
+# Read-only configuration caches to optimize database N+1 queries
+_org_settings_cache = {}
+_org_ai_settings_cache = {}
+_tenant_mailbox_cache = {}
+_signature_cache = {}
+
 
 def _clean_old_cache_entries():
     now = time.time()
@@ -127,7 +133,8 @@ class EmailService:
         graph_attachments: list,
         cc_emails: list,
         bcc_emails: list,
-        prefix: str
+        prefix: str,
+        sender_display_name: Optional[str] = None
     ) -> str:
         from app.core.debug_logger import log_to_request_file
         log_to_request_file("Executing Scenario 2: Standard Outbound Email (sendMail)")
@@ -139,7 +146,8 @@ class EmailService:
             cc_emails=cc_emails,
             bcc_emails=bcc_emails,
             attachments=graph_attachments,
-            db_session=self.session
+            db_session=self.session,
+            sender_display_name=sender_display_name
         )
 
     async def _send_threaded_reply(
@@ -151,7 +159,8 @@ class EmailService:
         parent_message_id: str,
         cc_emails: list,
         bcc_emails: list,
-        prefix: str
+        prefix: str,
+        sender_display_name: Optional[str] = None
     ) -> str:
         from app.core.debug_logger import log_to_request_file
         log_to_request_file(f"Executing Scenario 1: Threaded Reply on parent message ID {parent_message_id}")
@@ -162,12 +171,14 @@ class EmailService:
             cc_emails=cc_emails,
             bcc_emails=bcc_emails,
             attachments=graph_attachments,
-            db_session=self.session
+            db_session=self.session,
+            sender_display_name=sender_display_name
         )
 
     async def send_tenant_email(self, request: EmailRequest) -> EmailResponse:
         import traceback
         import uuid
+        import sys
         from app.core.logging import request_id_var
         from app.core.debug_logger import log_to_request_file
         from app.services.email_branding_service import EmailBrandingService
@@ -178,6 +189,17 @@ class EmailService:
         log_to_request_file(f"Validated EmailRequest:\n{request.model_dump_json(indent=2)}")
 
         branding_service = EmailBrandingService(self.session)
+
+        # Traceability status flags
+        smtp_send_completed = False
+        email_log_insert_completed = False
+        attachment_insert_completed = False
+        followup_scheduling_completed = False
+        embedding_generation_started = False
+        campaign_enrollment_update_completed = False
+
+        recipient = request.customer_email
+        subject = request.subject
 
         class StepTracker:
             def __init__(self, num: int, name: str):
@@ -199,6 +221,40 @@ class EmailService:
                     msg = f"[STEP {self.num}] {self.name} - SUCCESS ({elapsed} ms)"
                     print(f"{prefix}{msg}", flush=True)
                     log_to_request_file(msg)
+
+        # Diagnostic Helper
+        def handle_diagnostic_failure(stage: str, exc: Exception, local_vars: dict):
+            tb = traceback.format_exc()
+            exc_class = type(exc).__name__
+            
+            # Find failing file and line number
+            tb_frames = traceback.extract_tb(exc.__traceback__)
+            failing_file = "Unknown"
+            failing_line = "Unknown"
+            if tb_frames:
+                last_frame = tb_frames[-1]
+                failing_file = last_frame.filename
+                failing_line = last_frame.lineno
+
+            diag_msg = (
+                f"===== RUNTIME EXCEPTION IN {stage.upper()} =====\n"
+                f"1. Recipient Email: {recipient}\n"
+                f"2. Full Python Traceback:\n{tb}\n"
+                f"3. Exception Class: {exc_class}\n"
+                f"4. Failing File: {failing_file}\n"
+                f"5. Failing Line Number: {failing_line}\n"
+                f"6. Local Variables: {repr(local_vars)}\n"
+                f"7. SMTP send completed: {smtp_send_completed}\n"
+                f"8. email_log insert completed: {email_log_insert_completed}\n"
+                f"9. attachment insert completed: {attachment_insert_completed}\n"
+                f"10. follow-up scheduling completed: {followup_scheduling_completed}\n"
+                f"11. embedding generation started: {embedding_generation_started}\n"
+                f"12. campaign enrollment update completed: {campaign_enrollment_update_completed}\n"
+                f"================================================="
+            )
+            print(diag_msg, file=sys.stderr, flush=True)
+            log_to_request_file(diag_msg)
+            logger.error("Email send path failure diagnostic", stage=stage, exc_class=exc_class, failing_line=failing_line)
 
         # STEP 1: Request received
         async with StepTracker(1, "Request received"):
@@ -222,12 +278,7 @@ class EmailService:
                     contact_name = str(cust_row[1])
                 log_to_request_file(f"Customer lookup result: ID={customer_id}, contact_name={contact_name}")
         except Exception as e:
-            tb_str = traceback.format_exc()
-            print(type(e))
-            print(repr(e))
-            traceback.print_exc()
-            log_to_request_file(f"Exception in Customer lookup: {type(e)} - {repr(e)}\nTraceback:\n{tb_str}")
-            logger.exception("FAILED SELECT customer")
+            handle_diagnostic_failure("Customer lookup", e, locals())
             await self.session.rollback()
             raise e
 
@@ -237,21 +288,22 @@ class EmailService:
         mailbox_email = "N/A"
         try:
             async with StepTracker(3, "Mailbox lookup"):
-                tok_res = await self.session.execute(
-                    text("SELECT mailbox_email FROM tenant_integrations WHERE organization_id = :org_id"),
-                    {"org_id": request.organization_id}
-                )
-                row = tok_res.fetchone()
-                if row:
-                    mailbox_email = row[0]
+                now = time.time()
+                org_id_str = str(request.organization_id)
+                if org_id_str in _tenant_mailbox_cache and now - _tenant_mailbox_cache[org_id_str]["cached_at"] <= CACHE_TTL_SECONDS:
+                    mailbox_email = _tenant_mailbox_cache[org_id_str]["data"]
+                else:
+                    tok_res = await self.session.execute(
+                        text("SELECT mailbox_email FROM tenant_integrations WHERE organization_id = :org_id"),
+                        {"org_id": request.organization_id}
+                    )
+                    row = tok_res.fetchone()
+                    if row:
+                        mailbox_email = row[0]
+                    _tenant_mailbox_cache[org_id_str] = {"data": mailbox_email, "cached_at": now}
                 log_to_request_file(f"Mailbox lookup result: mailbox_email={mailbox_email}")
         except Exception as e:
-            tb_str = traceback.format_exc()
-            print(type(e))
-            print(repr(e))
-            traceback.print_exc()
-            log_to_request_file(f"Exception in Mailbox lookup: {type(e)} - {repr(e)}\nTraceback:\n{tb_str}")
-            logger.exception("FAILED SELECT tenant_integrations")
+            handle_diagnostic_failure("Mailbox lookup", e, locals())
             await self.session.rollback()
             raise e
 
@@ -266,7 +318,6 @@ class EmailService:
                     for att in request.attachments:
                         storage_path = att.storage_path
                         if not storage_path and att.id:
-                            # Query storage_path (file_path) from follow_up_attachment_files using id
                             res_att = await self.session.execute(
                                 text("SELECT file_path FROM follow_up_attachment_files WHERE id = :id"),
                                 {"id": att.id}
@@ -289,33 +340,39 @@ class EmailService:
                     if tasks:
                         results = await asyncio.gather(*tasks)
                         graph_attachments = [r for r in results if r is not None]
+                attachment_insert_completed = True
                 log_to_request_file(f"Attachment download result: {len(graph_attachments)} attachments downloaded.")
         except Exception as e:
-            tb_str = traceback.format_exc()
-            print(type(e))
-            print(repr(e))
-            traceback.print_exc()
-            log_to_request_file(f"Exception in Download attachment: {type(e)} - {repr(e)}\nTraceback:\n{tb_str}")
-            logger.exception("ORIGINAL ERROR")
+            handle_diagnostic_failure("Download attachment", e, locals())
             await self.session.rollback()
             raise e
 
         # Resolve email provider dynamically via factory
-        factory = EmailProviderFactory(self.session)
-        provider = await factory.get_provider_for_tenant(request.organization_id)
+        try:
+            factory = EmailProviderFactory(self.session)
+            provider = await factory.get_provider_for_tenant(request.organization_id)
+        except Exception as e:
+            handle_diagnostic_failure("Provider Factory Resolution", e, locals())
+            await self.session.rollback()
+            raise e
 
         # Load Signature Settings
         try:
-            sig_config = await branding_service.get_signature(request.organization_id)
+            org_id_str = str(request.organization_id)
+            now = time.time()
+            if org_id_str in _signature_cache and now - _signature_cache[org_id_str]["cached_at"] <= CACHE_TTL_SECONDS:
+                sig_config = _signature_cache[org_id_str]["data"]
+            else:
+                sig_config = await branding_service.get_signature(request.organization_id)
+                _signature_cache[org_id_str] = {"data": sig_config, "cached_at": now}
         except Exception as e:
-            logger.exception("Failed loading signature settings")
+            handle_diagnostic_failure("Signature Settings Load", e, locals())
             await self.session.rollback()
             raise e
 
         # STEP 5: Render HTML and Plain Text
         try:
             async with StepTracker(5, "Render HTML and Plain Text"):
-                # Structured logs: Before Rendering
                 has_sep = "--" in request.html_body
                 has_reg = "best regards" in request.html_body.lower() or "regards" in request.html_body.lower()
                 has_sig = (sig_config.signature_html.lower() in request.html_body.lower()) if sig_config and sig_config.signature_html else False
@@ -328,20 +385,32 @@ class EmailService:
                     contains_org_signature=has_sig
                 )
 
-                # Clean body content
                 cleaned_body = branding_service.clean_and_format_body(request.html_body)
                 
-                # Render final HTML including sanitized signature and optional footer banner
                 final_html_body = branding_service.render_html_email(
                     body_content=cleaned_body,
                     signature_html=sig_config.signature_html if sig_config else None,
                     banner_url=sig_config.footer_image_url if sig_config else None
                 )
                 
-                # Render plain-text fallback dynamically on-the-fly
+                # Check if footer image exists and append it as an inline attachment
+                if sig_config and sig_config.footer_image_path:
+                    try:
+                        img_att = await _fetch_and_cache_attachment(
+                            sig_config.footer_image_path,
+                            strict=False,
+                            stats={"hits": 0, "misses": 0, "total_bytes": 0}
+                        )
+                        if img_att:
+                            img_att["isInline"] = True
+                            img_att["contentId"] = "signature_image"
+                            graph_attachments.append(img_att)
+                            final_html_body = final_html_body.replace(sig_config.footer_image_url, "cid:signature_image")
+                    except Exception as img_err:
+                        logger.warning("Failed to fetch signature footer image for inline attachment", error=str(img_err))
+                
                 final_plain_body = branding_service.render_plain_email(final_html_body)
 
-                # Structured logs: After Rendering HTML
                 has_sep_html = "--" in final_html_body
                 has_reg_html = "best regards" in final_html_body.lower() or "regards" in final_html_body.lower()
                 has_sig_html = (sig_config.signature_html.lower() in final_html_body.lower()) if sig_config and sig_config.signature_html else False
@@ -354,7 +423,6 @@ class EmailService:
                     contains_org_signature=has_sig_html
                 )
 
-                # Structured logs: After Rendering Plain Text
                 has_sep_plain = "--" in final_plain_body
                 has_reg_plain = "best regards" in final_plain_body.lower() or "regards" in final_plain_body.lower()
                 has_sig_plain = (sig_config.signature_html.lower() in final_plain_body.lower()) if sig_config and sig_config.signature_html else False
@@ -367,11 +435,9 @@ class EmailService:
                     contains_org_signature=has_sig_plain
                 )
 
-                # Requirement 4: Log final HTML and Plain Text bodies before Graph API call
-                logger.info("FINAL HTML Email Body to be sent", body=final_html_body)
-                logger.info("FINAL Plain Text Email Body to be sent", body=final_plain_body)
+                logger.info("FINAL HTML Email Body to be sent", body_length=len(final_html_body))
+                logger.info("FINAL Plain Text Email Body to be sent", body_length=len(final_plain_body))
 
-                # Structuring Graph API payload variables
                 _payload = {
                     "message": {
                         "subject": request.subject,
@@ -395,12 +461,7 @@ class EmailService:
                 log_to_request_file(f"Attachment Lifecycle Stage 6 - Final Graph payload immediately before sendMail(): attachments count = {len(graph_attachments)} | filenames = {[a.get('name') for a in graph_attachments if a]}")
                 log_to_request_file(f"Graph API payload compiled:\n{json.dumps(_payload, indent=2)}")
         except Exception as e:
-            tb_str = traceback.format_exc()
-            print(type(e))
-            print(repr(e))
-            traceback.print_exc()
-            log_to_request_file(f"Exception in Upload attachment: {type(e)} - {repr(e)}\nTraceback:\n{tb_str}")
-            logger.exception("ORIGINAL ERROR")
+            handle_diagnostic_failure("HTML rendering", e, locals())
             await self.session.rollback()
             raise e
 
@@ -408,15 +469,14 @@ class EmailService:
         parent_graph_message_id = None
         is_reply_expected = False
 
-        if request.parent_message_id:
-            parent_graph_message_id = request.parent_message_id
-            is_reply_expected = True
-            log_to_request_file(f"Priority 1: Using parent_message_id directly from request: {parent_graph_message_id}")
-        elif request.references or request.in_reply_to:
-            # Priority 2: Expected to be a reply, parent_message_id missing -> lookup from DB
-            is_reply_expected = True
-            log_to_request_file("Priority 2: Request is expected to be a threaded reply. Attempting DB lookup...")
-            try:
+        try:
+            if request.parent_message_id:
+                parent_graph_message_id = request.parent_message_id
+                is_reply_expected = True
+                log_to_request_file(f"Priority 1: Using parent_message_id directly from request: {parent_graph_message_id}")
+            elif request.references or request.in_reply_to:
+                is_reply_expected = True
+                log_to_request_file("Priority 2: Request is expected to be a threaded reply. Attempting DB lookup...")
                 res_parent = await self.session.execute(text("""
                     SELECT graph_message_id 
                     FROM email_log 
@@ -438,35 +498,40 @@ class EmailService:
                     log_to_request_file(f"Resolved parent Graph message ID from DB lookup: {parent_graph_message_id}")
                 else:
                     log_to_request_file("DB lookup returned no matching parent inbound email.")
-            except Exception as lookup_ex:
-                logger.warning("Failed to lookup parent Graph message ID in DB", error=str(lookup_ex))
-        else:
-            # Priority 3: Brand-new outbound message -> Go straight to sendMail flow without DB query
-            log_to_request_file("Priority 3: Brand-new outbound message. Proceeding straight to sendMail flow.")
+            else:
+                log_to_request_file("Priority 3: Brand-new outbound message. Proceeding straight to sendMail flow.")
+        except Exception as e:
+            handle_diagnostic_failure("Parent Message Resolution", e, locals())
+            await self.session.rollback()
+            raise e
 
-        # Load default CC/BCC from organization settings table
+        # Load default CC/BCC/Sender Display Name from organization settings table
         org_cc = []
         org_bcc = []
+        sender_display_name = None
         try:
-            org_settings_res = await self.session.execute(text("""
-                SELECT cc_emails, bcc_emails FROM organization_settings WHERE organization_id = :org_id
-            """), {"org_id": request.organization_id})
-            org_settings_row = org_settings_res.fetchone()
-            if org_settings_row:
-                org_cc = org_settings_row[0] or []
-                org_bcc = org_settings_row[1] or []
+            org_id_str = str(request.organization_id)
+            now = time.time()
+            if org_id_str in _org_settings_cache and now - _org_settings_cache[org_id_str]["cached_at"] <= CACHE_TTL_SECONDS:
+                cached_settings = _org_settings_cache[org_id_str]["data"]
+                org_cc = cached_settings["cc"]
+                org_bcc = cached_settings["bcc"]
+                sender_display_name = cached_settings["sender_display_name"]
+            else:
+                org_settings_res = await self.session.execute(text("""
+                    SELECT cc_emails, bcc_emails, sender_display_name FROM organization_settings WHERE organization_id = :org_id
+                """), {"org_id": request.organization_id})
+                org_settings_row = org_settings_res.fetchone()
+                if org_settings_row:
+                    org_cc = org_settings_row[0] or []
+                    org_bcc = org_settings_row[1] or []
+                    sender_display_name = org_settings_row[2]
+                _org_settings_cache[org_id_str] = {
+                    "data": {"cc": org_cc, "bcc": org_bcc, "sender_display_name": sender_display_name},
+                    "cached_at": now
+                }
         except Exception as org_settings_ex:
-            logger.warning("Failed to load CC/BCC from organization settings", error=str(org_settings_ex))
-
-        # Recipient Merge Priority Rules:
-        # - Request TO is highest priority.
-        # - Request CC is merged first.
-        # - Organization default CC is appended.
-        # - Request BCC is merged first.
-        # - Organization default BCC is appended.
-        # - Deduplicate case-insensitively.
-        # - Remove duplicates across TO, CC and BCC.
-        # - Ignore empty or whitespace-only values.
+            logger.warning("Failed to load CC/BCC/Sender Display Name from organization settings", error=str(org_settings_ex))
 
         primary_to = request.customer_email.strip().lower()
 
@@ -476,24 +541,27 @@ class EmailService:
         # Load legacy default CC for backward compatibility on replies
         legacy_cc_list = []
         try:
-            settings_res = await self.session.execute(text("""
-                SELECT default_cc_emails FROM organization_ai_settings WHERE organization_id = :org_id
-            """), {"org_id": request.organization_id})
-            settings_row = settings_res.fetchone()
-            if settings_row and settings_row[0]:
-                import json
-                legacy_cc_list = json.loads(settings_row[0]) if isinstance(settings_row[0], str) else settings_row[0]
+            org_id_str = str(request.organization_id)
+            now = time.time()
+            if org_id_str in _org_ai_settings_cache and now - _org_ai_settings_cache[org_id_str]["cached_at"] <= CACHE_TTL_SECONDS:
+                legacy_cc_list = _org_ai_settings_cache[org_id_str]["data"]
+            else:
+                settings_res = await self.session.execute(text("""
+                    SELECT default_cc_emails FROM organization_ai_settings WHERE organization_id = :org_id
+                """), {"org_id": request.organization_id})
+                settings_row = settings_res.fetchone()
+                if settings_row and settings_row[0]:
+                    import json
+                    legacy_cc_list = json.loads(settings_row[0]) if isinstance(settings_row[0], str) else settings_row[0]
+                _org_ai_settings_cache[org_id_str] = {"data": legacy_cc_list, "cached_at": now}
         except Exception as settings_ex:
             logger.warning("Failed to load default CC emails from AI settings", error=str(settings_ex))
 
-        # Append legacy CC if reply is expected
         if is_reply_expected:
             raw_cc_list.extend(legacy_cc_list)
 
-        # Append organization settings default CC
         raw_cc_list.extend(org_cc)
 
-        # Clean and deduplicate CC
         merged_cc = []
         seen_cc = set()
         for cc in raw_cc_list:
@@ -508,7 +576,6 @@ class EmailService:
         raw_bcc_list = list(request.bcc_emails or [])
         raw_bcc_list.extend(org_bcc)
 
-        # Clean and deduplicate BCC
         merged_bcc = []
         seen_bcc = set()
         for bcc in raw_bcc_list:
@@ -521,17 +588,16 @@ class EmailService:
                     merged_bcc.append(clean_bcc)
                     seen_bcc.add(clean_bcc_lower)
 
-        # STEP 6: Send Graph Email
+        # STEP 6: Send Email
         try:
             if is_reply_expected:
                 if not parent_graph_message_id:
-                    # Do NOT thread unknown replies, raise delivery failure
                     error_msg = "Threaded reply expected but no valid parent Graph message could be resolved."
                     log_to_request_file(f"Delivery Failed: {error_msg}")
                     logger.error(error_msg)
                     raise EmailSendError(error_msg)
                     
-                async with StepTracker(6, "Send Graph Threaded Reply"):
+                async with StepTracker(6, "Send Threaded Reply"):
                     message_id = await self._send_threaded_reply(
                         request=request,
                         provider=provider,
@@ -540,10 +606,11 @@ class EmailService:
                         parent_message_id=parent_graph_message_id,
                         cc_emails=merged_cc,
                         bcc_emails=merged_bcc,
-                        prefix=prefix
+                        prefix=prefix,
+                        sender_display_name=sender_display_name
                     )
             else:
-                async with StepTracker(6, "Send Graph Email"):
+                async with StepTracker(6, "Send Email"):
                     message_id = await self._send_new_email(
                         request=request,
                         provider=provider,
@@ -551,17 +618,14 @@ class EmailService:
                         graph_attachments=graph_attachments,
                         cc_emails=merged_cc,
                         bcc_emails=merged_bcc,
-                        prefix=prefix
+                        prefix=prefix,
+                        sender_display_name=sender_display_name
                     )
-            logger.info("GRAPH API SUCCESS")
-            log_to_request_file(f"Graph API Success: message_id={message_id}")
+            smtp_send_completed = True
+            logger.info("EMAIL SEND SUCCESS")
+            log_to_request_file(f"Email Send Success: message_id={message_id}")
         except Exception as e:
-            tb_str = traceback.format_exc()
-            print(type(e))
-            print(repr(e))
-            traceback.print_exc()
-            log_to_request_file(f"Exception in Send Graph Email: {type(e)} - {repr(e)}\nTraceback:\n{tb_str}")
-            logger.exception("ORIGINAL ERROR")
+            handle_diagnostic_failure("Send Email", e, locals())
             if parent_graph_message_id:
                 try:
                     await self.session.execute(
@@ -587,7 +651,6 @@ class EmailService:
         true_thread_id = request.thread_id or request.conversation_id
         true_internet_id = request.internet_message_id or message_id
         
-        # If thread_id / conv_id are not provided, fallback to message_id as the thread root
         if not true_thread_id:
             true_thread_id = message_id
         if not true_conv_id:
@@ -664,17 +727,12 @@ class EmailService:
                 )
                 logger.info("FLUSH")
                 await self.session.flush()
+                email_log_insert_completed = True
                 log_to_request_file("Email log insert result: Success")
         except Exception as e:
-            tb_str = traceback.format_exc()
-            print(type(e))
-            print(repr(e))
-            traceback.print_exc()
-            log_to_request_file(f"Exception in Save Email History: {type(e)} - {repr(e)}\nTraceback:\n{tb_str}")
-            logger.exception("FAILED INSERT email_log")
+            handle_diagnostic_failure("Save Email History", e, locals())
             await self.session.rollback()
             raise e
-
 
         # STEP 8: Commit
         logger.info("COMMIT")
@@ -684,12 +742,7 @@ class EmailService:
                 await self.session.commit()
                 log_to_request_file("Commit result: Success")
         except Exception as e:
-            tb_str = traceback.format_exc()
-            print(type(e))
-            print(repr(e))
-            traceback.print_exc()
-            log_to_request_file(f"Exception in Commit: {type(e)} - {repr(e)}\nTraceback:\n{tb_str}")
-            logger.exception("FAILED COMMIT")
+            handle_diagnostic_failure("Commit", e, locals())
             await self.session.rollback()
             raise e
 
@@ -705,9 +758,5 @@ class EmailService:
             print(f"Returning EmailResponse success={response.success} message_id={response.message_id} sent_at={response.sent_at}", flush=True)
             return response
         except Exception as serialization_error:
-            tb_str = traceback.format_exc()
-            print(type(serialization_error))
-            print(repr(serialization_error))
-            traceback.print_exc()
-            log_to_request_file(f"Exception in response serialization: {type(serialization_error)} - {repr(serialization_error)}\nTraceback:\n{tb_str}")
+            handle_diagnostic_failure("Response Serialization", serialization_error, locals())
             raise serialization_error

@@ -82,6 +82,7 @@ export default function FollowUpsModulePage() {
   const [savingSettings, setSavingSettings] = useState(false);
 
   // Data State
+  const [orgTimezone, setOrgTimezone] = useState('UTC');
   const [maxFollowUps, setMaxFollowUps] = useState(3);
   const [stopOnReply, setStopOnReply] = useState(true);
   const [steps, setSteps] = useState<FollowUpStep[]>([]);
@@ -135,16 +136,18 @@ export default function FollowUpsModulePage() {
   const fetchInitialData = async () => {
     try {
       setLoading(true);
-      const [settingsRes, profilesRes, queueRes, historyRes] = await Promise.all([
+      const [settingsRes, profilesRes, queueRes, historyRes, engagementSettingsRes] = await Promise.all([
         api.get('/api/v1/follow-ups/settings'),
         api.get('/api/v1/follow-ups/attachment-profiles'),
         api.get('/api/v1/follow-ups/queue'),
-        api.get('/api/v1/follow-ups/executions/history')
+        api.get('/api/v1/follow-ups/executions/history'),
+        api.get('/api/v1/engagement/settings')
       ]);
 
       setExecutions(historyRes.data || []);
       setMaxFollowUps(settingsRes.data.max_follow_ups || 3);
       setStopOnReply(settingsRes.data.stop_on_reply !== false);
+      setOrgTimezone(engagementSettingsRes.data.timezone || 'UTC');
 
       // Seed default configs if empty
       const rawSteps = settingsRes.data.follow_up_sequence_config || [];
@@ -609,7 +612,7 @@ export default function FollowUpsModulePage() {
                             </td>
                             <td className="py-3 font-bold text-brand-primary">Step {item.step_number}</td>
                             <td className="py-3 font-mono font-bold text-2xs text-text-secondary select-text">
-                              {item.scheduled_datetime ? new Date(item.scheduled_datetime).toLocaleString() : 'N/A'}
+                              {item.scheduled_datetime ? new Date(item.scheduled_datetime).toLocaleString('en-US', { timeZone: orgTimezone }) : 'N/A'}
                             </td>
                             <td className="py-3 text-2xs font-bold text-text-secondary">
                               {item.attachment_profile_name || <span className="text-text-muted italic">None</span>}
@@ -1081,6 +1084,7 @@ export default function FollowUpsModulePage() {
           <FollowUpDrawer
             isOpen={isDrawerOpen}
             item={selectedQueueItem}
+            orgTimezone={orgTimezone}
             onClose={() => { setIsDrawerOpen(false); setSelectedQueueItem(null); }}
             onSendNow={async (id) => handleQueueAction(id, 'send_now')}
             onApprove={async (id) => handleQueueAction(id, 'approve')}

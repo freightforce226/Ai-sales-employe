@@ -127,13 +127,49 @@ class EmailBrandingService:
         """
         Renders a responsive, Outlook and Gmail compatible HTML email using only inline styles.
         """
-        import traceback
-        stack = "".join(traceback.format_list(traceback.extract_stack()))
-        logger.info("ENTER render_html_email()", call_stack=stack)
+        logger.info("ENTER render_html_email()")
         
+        body_content = body_content.strip()
+
+        # 1. Detect if body_content is already a complete HTML document
+        body_lower = body_content.lower().strip()
+        is_full_html = (
+            body_lower.startswith("<!doctype html") or
+            body_lower.startswith("<html") or
+            ("<html" in body_lower and "</html>" in body_lower)
+        )
+
+        if is_full_html:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(body_content, "html.parser")
+            
+            # Check if signature already exists
+            has_existing_sig = False
+            if signature_html:
+                if soup.find(id="org-signature") or soup.find(class_="signature-block"):
+                    has_existing_sig = True
+            
+            if signature_html and not has_existing_sig:
+                sig_content = signature_html.strip()
+                optional_banner = ""
+                if banner_url:
+                    optional_banner = f'<div style="margin-top:24px;"><img src="{banner_url}" alt="Banner" style="max-width:100%;height:auto;border:0;display:block;" /></div>'
+                
+                # Signature wrapper exactly as requested
+                inject_content = f'<div style="margin-top:20px;padding-top:14px;border-top:1px solid #e5e7eb;">{sig_content}{optional_banner}</div>'
+                inject_soup = BeautifulSoup(inject_content, "html.parser")
+                
+                body_tag = soup.find("body")
+                if body_tag:
+                    body_tag.append(inject_soup)
+                else:
+                    soup.append(inject_soup)
+            
+            logger.info("EXIT render_html_email() - full html processed")
+            return str(soup).strip()
+
         # Convert plain paragraphs in body to clean HTML paragraph tags if they aren't already HTML
         formatted_body = ""
-        body_content = body_content.strip()
         
         if not body_content.startswith("<p>") and not body_content.startswith("<div>"):
             paragraphs = body_content.split("\n\n")

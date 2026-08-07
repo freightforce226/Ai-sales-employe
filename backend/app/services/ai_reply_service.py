@@ -35,6 +35,7 @@ from bs4 import BeautifulSoup
 from app.models.ai_reply import OrganizationAiSettings
 from app.schemas.ai_reply import AIReplySettingsUpdate, AIReplyGenerateResponse, AIReplyPendingResponse, AIReplyCompleteRequest, AIReplyLockRequest
 from app.services.llm_service import LLMService
+from app.services.inquiry_classifier import InquiryClassifier
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -156,7 +157,14 @@ class AIReplyService:
                 prev_outbound = row
                 break
 
-        subject = "New Inquiry"
+        inbound_subject = None
+        for row in rows:
+            direction, sub, body, sent_at = row
+            if direction == "inbound" and sub:
+                inbound_subject = sub
+                break
+
+        subject = inbound_subject or "New Inquiry"
         thread_messages = []
 
         if prev_outbound:
@@ -230,6 +238,61 @@ Rules:
         
         # 2. Extract thread context
         context_dict = await self.build_thread_context(org_id, customer_id, thread_id, customer_reply_text)
+        
+        # Verify Human Takeover (Verification 2 - Post-Lock, Pre-LLM)
+        res_inbound = await self.db.execute(
+            text("""
+                SELECT id, sent_at, internet_message_id, conversation_id FROM email_log
+                WHERE organization_id = :org_id
+                  AND customer_id = :customer_id
+                  AND thread_id = :thread_id
+                  AND direction = 'inbound'
+                ORDER BY sent_at DESC, created_at DESC
+                LIMIT 1
+            """),
+            {"org_id": org_id, "customer_id": customer_id, "thread_id": thread_id}
+        )
+        row_inbound = res_inbound.fetchone()
+        if row_inbound:
+            inbound_id, inbound_sent_at, inbound_internet_msg_id, inbound_conv_id = row_inbound
+            
+            takeover_res = await self.db.execute(
+                text("""
+                    SELECT 1 FROM email_log
+                    WHERE organization_id = :org_id
+                      AND direction = 'outbound'
+                      AND sent_at > :inbound_sent_at
+                      AND (
+                          (thread_id = :thread_id AND thread_id IS NOT NULL AND :thread_id IS NOT NULL)
+                          OR (conversation_id = :conv_id AND conversation_id IS NOT NULL AND :conv_id IS NOT NULL)
+                          OR (in_reply_to = :internet_msg_id AND in_reply_to IS NOT NULL AND :internet_msg_id IS NOT NULL)
+                          OR ("references" LIKE '%' || :internet_msg_id || '%' AND :internet_msg_id IS NOT NULL)
+                      )
+                    LIMIT 1
+                """),
+                {
+                    "org_id": org_id,
+                    "inbound_sent_at": inbound_sent_at,
+                    "thread_id": thread_id,
+                    "conv_id": inbound_conv_id,
+                    "internet_msg_id": inbound_internet_msg_id
+                }
+            )
+            if takeover_res.fetchone():
+                # Revert lock status back to 'delivered'
+                await self.db.execute(
+                    text("""
+                        UPDATE email_log
+                        SET delivery_status = 'delivered',
+                            queued_at = NULL
+                        WHERE id = :inbound_id
+                          AND delivery_status = 'queued'
+                    """),
+                    {"inbound_id": inbound_id}
+                )
+                await self.db.commit()
+                logger.info("Human takeover detected post-lock: reverting lock and aborting draft generation.", resolved_id=str(inbound_id))
+                raise ValueError("already_processing")
         
         # 3. Build Prompt
         prompt = self.build_reply_prompt(ai_settings, context_dict)
@@ -386,7 +449,24 @@ Rules:
                 settings.default_cc_emails AS default_cc,
                 settings.ai_writing_instructions,
                 COALESCE(sig.signature_html, settings.email_signature) AS email_signature,
-                el.internet_message_id
+                el.internet_message_id,
+                EXISTS (
+                    SELECT 1 FROM email_log el_prev
+                    WHERE el_prev.direction = 'outbound'
+                      AND el_prev.customer_id = el.customer_id
+                      AND el_prev.organization_id = el.organization_id
+                      AND el_prev.sent_at < el.sent_at
+                      AND (
+                          (el_prev.thread_id = el.thread_id AND el_prev.thread_id IS NOT NULL AND el.thread_id IS NOT NULL)
+                          OR (el_prev.conversation_id = el.conversation_id AND el_prev.conversation_id IS NOT NULL AND el.conversation_id IS NOT NULL)
+                          OR (el_prev.internet_message_id = el.in_reply_to AND el_prev.internet_message_id IS NOT NULL)
+                          OR (el.references LIKE '%' || el_prev.internet_message_id || '%' AND el_prev.internet_message_id IS NOT NULL AND el.references IS NOT NULL)
+                          OR (
+                              LOWER(REGEXP_REPLACE(el.subject, '^(re|fwd|reply|aw|ref):\s*', '', 'i')) = LOWER(REGEXP_REPLACE(el_prev.subject, '^(re|fwd|reply|aw|ref):\s*', '', 'i'))
+                              AND el.subject IS NOT NULL AND el_prev.subject IS NOT NULL
+                          )
+                      )
+                ) AS has_prev_outbound
             FROM email_log el
             JOIN customers c ON el.customer_id = c.id
             JOIN organizations o ON el.organization_id = o.id
@@ -396,23 +476,6 @@ Rules:
             WHERE el.direction = 'inbound'
               AND el.delivery_status = 'delivered'
               AND settings.ai_enabled = TRUE
-              AND EXISTS (
-                  SELECT 1 FROM email_log el_prev
-                  WHERE el_prev.direction = 'outbound'
-                    AND el_prev.customer_id = el.customer_id
-                    AND el_prev.organization_id = el.organization_id
-                    AND el_prev.sent_at < el.sent_at
-                    AND (
-                        (el_prev.thread_id = el.thread_id AND el_prev.thread_id IS NOT NULL AND el.thread_id IS NOT NULL)
-                        OR (el_prev.conversation_id = el.conversation_id AND el_prev.conversation_id IS NOT NULL AND el.conversation_id IS NOT NULL)
-                        OR (el_prev.internet_message_id = el.in_reply_to AND el_prev.internet_message_id IS NOT NULL)
-                        OR (el.references LIKE '%' || el_prev.internet_message_id || '%' AND el_prev.internet_message_id IS NOT NULL AND el.references IS NOT NULL)
-                        OR (
-                            LOWER(REGEXP_REPLACE(el.subject, '^(re|fwd|reply|aw|ref):\s*', '', 'i')) = LOWER(REGEXP_REPLACE(el_prev.subject, '^(re|fwd|reply|aw|ref):\s*', '', 'i'))
-                            AND el.subject IS NOT NULL AND el_prev.subject IS NOT NULL
-                        )
-                    )
-              )
               AND NOT EXISTS (
                   SELECT 1 FROM email_log el_out 
                   WHERE el_out.direction = 'outbound' 
@@ -434,8 +497,18 @@ Rules:
         
         pending_list = []
         for r in rows:
-            reply_id, org_id, org_name, cust_id, cust_name, cust_email, mailbox_email, thread_id, conv_id, msg_id, subject, latest_email, received_dt, reply_tone, default_cc, instructions, signature, internet_msg_id = r
+            reply_id, org_id, org_name, cust_id, cust_name, cust_email, mailbox_email, thread_id, conv_id, msg_id, subject, latest_email, received_dt, reply_tone, default_cc, instructions, signature, internet_msg_id, has_prev_outbound = r
             
+            # If not thread-matched, run classification check (Case B)
+            if not has_prev_outbound:
+                soup = BeautifulSoup(latest_email or "", "html.parser")
+                plain_text = soup.get_text()
+                
+                class_res = InquiryClassifier.classify(subject, plain_text, latest_email or "")
+                if not class_res.is_inquiry:
+                    # Skip non-inquiry direct emails
+                    continue
+
             # Map default_cc safely
             cc_emails = []
             if default_cc:
@@ -650,12 +723,16 @@ Rules:
             thread_id=payload.thread_id
         )
 
+        resolved_sent_at = None
+        resolved_internet_msg_id = None
+        resolved_conv_id = None
+
         # Priority 1: reply_id (email_log.id)
         if payload.reply_id:
             path_used = "reply_id"
             res = await self.db.execute(
                 text("""
-                    SELECT id, organization_id, customer_id, thread_id, graph_message_id, body, delivery_status FROM email_log
+                    SELECT id, organization_id, customer_id, thread_id, graph_message_id, body, delivery_status, sent_at, internet_message_id, conversation_id FROM email_log
                     WHERE id = :reply_id
                     LIMIT 1
                 """),
@@ -663,14 +740,14 @@ Rules:
             )
             row = res.fetchone()
             if row:
-                target_id, resolved_org_id, resolved_customer_id, resolved_thread_id, resolved_graph_message_id, resolved_body, current_status = row
+                target_id, resolved_org_id, resolved_customer_id, resolved_thread_id, resolved_graph_message_id, resolved_body, current_status, resolved_sent_at, resolved_internet_msg_id, resolved_conv_id = row
 
         # Priority 2: message_id (graph_message_id)
         elif payload.message_id:
             path_used = "graph_message_id"
             res = await self.db.execute(
                 text("""
-                    SELECT id, organization_id, customer_id, thread_id, graph_message_id, body, delivery_status FROM email_log
+                    SELECT id, organization_id, customer_id, thread_id, graph_message_id, body, delivery_status, sent_at, internet_message_id, conversation_id FROM email_log
                     WHERE organization_id = :org_id
                       AND graph_message_id = :message_id
                     LIMIT 1
@@ -679,14 +756,14 @@ Rules:
             )
             row = res.fetchone()
             if row:
-                target_id, resolved_org_id, resolved_customer_id, resolved_thread_id, resolved_graph_message_id, resolved_body, current_status = row
+                target_id, resolved_org_id, resolved_customer_id, resolved_thread_id, resolved_graph_message_id, resolved_body, current_status, resolved_sent_at, resolved_internet_msg_id, resolved_conv_id = row
 
         # Priority 3: thread_id
         elif payload.thread_id:
             path_used = "thread_id"
             res = await self.db.execute(
                 text("""
-                    SELECT id, organization_id, customer_id, thread_id, graph_message_id, body, delivery_status FROM email_log
+                    SELECT id, organization_id, customer_id, thread_id, graph_message_id, body, delivery_status, sent_at, internet_message_id, conversation_id FROM email_log
                     WHERE organization_id = :org_id
                       AND thread_id = :thread_id
                       AND direction = 'inbound'
@@ -697,10 +774,48 @@ Rules:
             )
             row = res.fetchone()
             if row:
-                target_id, resolved_org_id, resolved_customer_id, resolved_thread_id, resolved_graph_message_id, resolved_body, current_status = row
+                target_id, resolved_org_id, resolved_customer_id, resolved_thread_id, resolved_graph_message_id, resolved_body, current_status, resolved_sent_at, resolved_internet_msg_id, resolved_conv_id = row
 
         # Clean customer reply text
         clean_text = self._clean_context_message(resolved_body) if resolved_body else None
+
+        # Check for human takeover (Verification 1)
+        if target_id and resolved_sent_at:
+            takeover_res = await self.db.execute(
+                text("""
+                    SELECT 1 FROM email_log
+                    WHERE organization_id = :org_id
+                      AND direction = 'outbound'
+                      AND sent_at > :inbound_sent_at
+                      AND (
+                          (thread_id = :thread_id AND thread_id IS NOT NULL AND :thread_id IS NOT NULL)
+                          OR (conversation_id = :conv_id AND conversation_id IS NOT NULL AND :conv_id IS NOT NULL)
+                          OR (in_reply_to = :internet_msg_id AND in_reply_to IS NOT NULL AND :internet_msg_id IS NOT NULL)
+                          OR ("references" LIKE '%' || :internet_msg_id || '%' AND :internet_msg_id IS NOT NULL)
+                      )
+                    LIMIT 1
+                """),
+                {
+                    "org_id": resolved_org_id,
+                    "inbound_sent_at": resolved_sent_at,
+                    "thread_id": resolved_thread_id,
+                    "conv_id": resolved_conv_id,
+                    "internet_msg_id": resolved_internet_msg_id
+                }
+            )
+            if takeover_res.fetchone():
+                logger.info("Human takeover detected in lock_reply: newer outbound exists.", resolved_id=str(target_id))
+                return {
+                    "success": False,
+                    "status": None,
+                    "reason": "already_processing",
+                    "reply_id": target_id,
+                    "organization_id": resolved_org_id,
+                    "customer_id": resolved_customer_id,
+                    "thread_id": resolved_thread_id,
+                    "message_id": resolved_graph_message_id,
+                    "customer_reply_text": clean_text
+                }
 
         # 2. Log AFTER lookup
         if target_id:

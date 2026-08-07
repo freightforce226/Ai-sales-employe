@@ -62,3 +62,27 @@ Thumbs.db
 dist/
 build/
 frontend/.next/cache/
+
+# Scratch / Temporary
+scratch/
+tmp/
+temp/
+
+# Logs additional
+backend/logs/
+email_debug/
+
+# Coverage
+htmlcov/
+
+# Local databases
+*.sqlite3
+*.db
+
+# Runtime
+*.pid
+
+# Generated reports
+*.prof
+benchmark/
+reports/

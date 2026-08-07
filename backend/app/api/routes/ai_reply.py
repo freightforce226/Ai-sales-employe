@@ -101,6 +101,16 @@ async def generate_reply_draft(
             thread_id=request.thread_id,
             customer_reply_text=customer_reply_text
         )
+    except ValueError as ve:
+        if str(ve) == "already_processing":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="already_processing"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve)
+        )
     except HTTPException:
         raise
     except Exception as e:

@@ -5,6 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.logging import get_logger
 from app.providers import EmailProviderFactory
+from app.schemas.inbound_message import InboundMessage
 
 logger = get_logger(__name__)
 
@@ -19,9 +20,9 @@ class InboundSyncService:
         and aggregates processed statistics. Optionally filters by organization_ids.
         """
         start_time = time.time()
-        # Load active mailboxes
+        # Load active mailboxes with cursors and provider info
         query = """
-            SELECT id, organization_id, mailbox_email, last_graph_delta_link 
+            SELECT id, organization_id, mailbox_email, last_graph_delta_link, last_sync_cursor, provider 
             FROM tenant_integrations 
             WHERE is_active = true
         """
@@ -73,9 +74,14 @@ class InboundSyncService:
             integration_id = row[0]
             org_id = row[1]
             mailbox_email = row[2]
-            delta_link = row[3]
+            graph_delta_link = row[3]
+            smtp_sync_cursor = row[4]
+            provider_type = row[5] # 'microsoft_graph' or 'smtp'
 
-            logger.info("Initializing inbox delta sync for mailbox", org_id=str(org_id), mailbox=mailbox_email)
+            # Select the appropriate cursor with strict separation of concerns (no fallback)
+            sync_state = graph_delta_link if provider_type == 'microsoft_graph' else smtp_sync_cursor
+
+            logger.info("Initializing inbox delta sync for mailbox", org_id=str(org_id), mailbox=mailbox_email, provider=provider_type)
             try:
                 # 1. Update sync_started_at
                 await self.db.execute(text("""
@@ -87,16 +93,20 @@ class InboundSyncService:
                 await self.db.commit()
 
                 # 2. Resolve provider dynamically via factory
+                logger.info("INSTRUMENT: Resolving provider dynamically via factory...")
                 provider = await self.provider_factory.get_provider_for_tenant(org_id)
+                logger.info("INSTRUMENT: Provider resolved successfully.", provider_class=str(provider.__class__))
 
-                # 3. Fetch messages using abstract provider sync capability
-                delta_res = await provider.sync_inbound_emails(
+                # 3. Fetch messages using abstract provider sync capability returning InboundSyncResult
+                logger.info("INSTRUMENT: Fetching inbound messages from provider...", sync_state=sync_state)
+                sync_res = await provider.sync_inbound_emails(
                     org_id=org_id,
-                    sync_state=delta_link,
+                    sync_state=sync_state,
                     db_session=self.db
                 )
-                messages = delta_res.get("messages", [])
-                new_delta_link = delta_res.get("delta_link")
+                logger.info("INSTRUMENT: sync_inbound_emails returned successfully.", num_messages=len(sync_res.messages) if sync_res else 0)
+                messages = sync_res.messages
+                new_cursor = sync_res.new_cursor
 
                 stats["mailboxes_processed"] += 1
                 stats["organizations_processed"] += 1
@@ -104,7 +114,9 @@ class InboundSyncService:
                 # 4. Process each message
                 for msg in messages:
                     stats["messages_scanned"] += 1
+                    logger.info("INSTRUMENT: Processing inbound message...", provider_msg_id=msg.provider_message_id)
                     processed = await self._process_inbound_message(org_id, msg, mailbox_email)
+                    logger.info("INSTRUMENT: Inbound message processed.", inserted=processed["inserted"])
                     if processed["inserted"]:
                         stats["messages_inserted"] += 1
                     elif processed["skipped"]:
@@ -122,16 +134,27 @@ class InboundSyncService:
                     if processed.get("campaign_completed"):
                         stats["campaigns_completed"] += 1
 
-                # 5. Update completed state and delta links
-                await self.db.execute(text("""
-                    UPDATE tenant_integrations
-                    SET last_graph_delta_link = :delta_link,
-                        sync_completed_at = NOW(),
-                        last_successful_sync = NOW(),
-                        last_sync_error = NULL,
-                        updated_at = NOW()
-                    WHERE id = :id
-                """), {"id": integration_id, "delta_link": new_delta_link})
+                # 5. Update completed state and delta links based on provider type
+                if provider_type == 'microsoft_graph':
+                    await self.db.execute(text("""
+                        UPDATE tenant_integrations
+                        SET last_graph_delta_link = :cursor,
+                            sync_completed_at = NOW(),
+                            last_successful_sync = NOW(),
+                            last_sync_error = NULL,
+                            updated_at = NOW()
+                        WHERE id = :id
+                    """), {"id": integration_id, "cursor": new_cursor})
+                else:
+                    await self.db.execute(text("""
+                        UPDATE tenant_integrations
+                        SET last_sync_cursor = :cursor,
+                            sync_completed_at = NOW(),
+                            last_successful_sync = NOW(),
+                            last_sync_error = NULL,
+                            updated_at = NOW()
+                        WHERE id = :id
+                    """), {"id": integration_id, "cursor": new_cursor})
                 await self.db.commit()
 
             except Exception as e:
@@ -155,7 +178,7 @@ class InboundSyncService:
         stats["duration_seconds"] = int(time.time() - start_time)
         return stats
 
-    async def _process_inbound_message(self, org_id: uuid.UUID, msg: dict, mailbox_email: str = "unknown_mailbox") -> dict:
+    async def _process_inbound_message(self, org_id: uuid.UUID, msg: InboundMessage, mailbox_email: str = "unknown_mailbox") -> dict:
         """
         Deduplicates, inserts inbound message into email_log, and triggers reply matching.
         """
@@ -168,9 +191,9 @@ class InboundSyncService:
             "schedule_completed": False,
             "campaign_completed": False
         }
-        graph_message_id = msg.get("id")
-        internet_message_id = msg.get("internetMessageId")
-        conversation_id = msg.get("conversationId")
+        graph_message_id = msg.provider_message_id
+        internet_message_id = msg.internet_message_id
+        conversation_id = msg.conversation_id
 
         if not graph_message_id:
             return result
@@ -193,8 +216,7 @@ class InboundSyncService:
             return result
 
         # Parse from address and check customer matching
-        from_dict = msg.get("from", {})
-        from_email = from_dict.get("emailAddress", {}).get("address")
+        from_email = msg.from_email
         if not from_email:
             return result
 
@@ -212,7 +234,7 @@ class InboundSyncService:
                 "Skipping inbound message because sender is unknown",
                 mailbox=mailbox_email,
                 sender_email=from_email,
-                subject=msg.get("subject", ""),
+                subject=msg.subject or "",
                 reason="Unknown sender"
             )
             result["skipped_unknown_sender"] = True
@@ -221,29 +243,19 @@ class InboundSyncService:
         result["reply_candidate"] = True
 
         # Retrieve extended properties (references & in-reply-to)
-        references = None
-        in_reply_to = None
-        for prop in msg.get("singleValueExtendedProperties", []):
-            if prop.get("id") == "String 0x1039":
-                references = prop.get("value")
-            elif prop.get("id") == "String 0x1042":
-                in_reply_to = prop.get("value")
+        references = msg.references
+        in_reply_to = msg.in_reply_to
 
         # Parse dates
-        received_str = msg.get("receivedDateTime")
-        received_at = datetime.now(timezone.utc)
-        if received_str:
-            try:
-                received_at = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
-            except Exception:
-                pass
+        received_at = msg.received_at
 
         # Insert email_log
         log_id = uuid.uuid4()
-        subject = msg.get("subject", "")
-        body = msg.get("body", {}).get("content", "")
-        has_attachments = msg.get("hasAttachments", False)
+        subject = msg.subject or ""
+        body = msg.html_body or ""
+        has_attachments = msg.has_attachments
 
+        logger.info("INSTRUMENT: Executing database insert for email_log...")
         await self.db.execute(text("""
             INSERT INTO email_log (
                 id, organization_id, customer_id, direction, email_type, 
@@ -271,7 +283,9 @@ class InboundSyncService:
             "references": references,
             "in_reply_to": in_reply_to
         })
+        logger.info("INSTRUMENT: Database insert executed. Committing...")
         await self.db.commit()
+        logger.info("INSTRUMENT: Database commit successful.")
         result["inserted"] = True
 
         # Perform Reply Detection if sender matches a customer

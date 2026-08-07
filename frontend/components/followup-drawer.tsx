@@ -18,12 +18,13 @@ interface QueueItem {
 interface FollowUpDrawerProps {
   isOpen: boolean;
   item: QueueItem | null;
+  orgTimezone?: string;
   onClose: () => void;
   onSendNow: (id: string) => Promise<void>;
   onApprove: (id: string) => Promise<void>;
 }
 
-export function FollowUpDrawer({ isOpen, item, onClose, onSendNow, onApprove }: FollowUpDrawerProps) {
+export function FollowUpDrawer({ isOpen, item, orgTimezone = 'UTC', onClose, onSendNow, onApprove }: FollowUpDrawerProps) {
   if (!item) return null;
 
   return (
@@ -97,7 +98,7 @@ export function FollowUpDrawer({ isOpen, item, onClose, onSendNow, onApprove }: 
                   <div>
                     <div className="text-[10px] text-text-muted uppercase font-bold select-none">Scheduled For</div>
                     <div className="text-text-primary mt-0.5 font-mono">
-                      {item.scheduled_datetime ? new Date(item.scheduled_datetime).toLocaleString() : 'N/A'}
+                      {item.scheduled_datetime ? new Date(item.scheduled_datetime).toLocaleString('en-US', { timeZone: orgTimezone }) : 'N/A'}
                     </div>
                   </div>
                 </div>

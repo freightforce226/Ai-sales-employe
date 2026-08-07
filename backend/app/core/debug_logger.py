@@ -36,6 +36,9 @@ def log_to_request_file(message: str) -> None:
     """
     Append a log message to the current request's log file.
     """
+    if len(message) > 2048:
+        message = message[:2000] + f"... [TRUNCATED {len(message) - 2000} chars]"
+        
     file_path = current_log_file_path.get()
     if file_path:
         try:
@@ -48,6 +51,9 @@ def log_validation_error(error_details: str) -> None:
     """
     Append validation error logs to logs/email_validation.log.
     """
+    if len(error_details) > 2048:
+        error_details = error_details[:2000] + f"... [TRUNCATED {len(error_details) - 2000} chars]"
+        
     val_log_path = os.path.join(LOGS_DIR, "email_validation.log")
     try:
         with open(val_log_path, "a", encoding="utf-8") as f:

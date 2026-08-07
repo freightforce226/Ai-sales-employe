@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.providers.base import BaseEmailProvider
 from app.clients.microsoft_graph_client import MicrosoftGraphClient
 from app.services.token_service import TokenService
+from app.schemas.inbound_message import InboundSyncResult
 
 class MicrosoftGraphProvider(BaseEmailProvider):
     def __init__(self):
@@ -23,7 +24,8 @@ class MicrosoftGraphProvider(BaseEmailProvider):
         cc_emails: List[str],
         bcc_emails: List[str],
         attachments: List[Dict[str, Any]],
-        db_session: AsyncSession
+        db_session: AsyncSession,
+        sender_display_name: Optional[str] = None
     ) -> str:
         access_token = await self._get_access_token(org_id, db_session)
         return await self.graph_client.send_email(
@@ -44,7 +46,8 @@ class MicrosoftGraphProvider(BaseEmailProvider):
         cc_emails: List[str],
         bcc_emails: List[str],
         attachments: List[Dict[str, Any]],
-        db_session: AsyncSession
+        db_session: AsyncSession,
+        sender_display_name: Optional[str] = None
     ) -> str:
         import asyncio
         import httpx
@@ -130,6 +133,96 @@ class MicrosoftGraphProvider(BaseEmailProvider):
         org_id: UUID,
         sync_state: Optional[str],
         db_session: AsyncSession
-    ) -> Dict[str, Any]:
+    ) -> InboundSyncResult:
+        from datetime import datetime, timezone
+        from bs4 import BeautifulSoup
+        from app.schemas.inbound_message import InboundMessage, InboundSyncResult
+        
         access_token = await self._get_access_token(org_id, db_session)
-        return await self.graph_client.fetch_inbox_messages_delta(access_token, sync_state)
+        delta_res = await self.graph_client.fetch_inbox_messages_delta(access_token, sync_state)
+        
+        messages = delta_res.get("messages", [])
+        new_delta_link = delta_res.get("delta_link") or ""
+        
+        normalized_messages = []
+        for msg in messages:
+            provider_msg_id = msg.get("id") or ""
+            internet_msg_id = msg.get("internetMessageId") or ""
+            conversation_id = msg.get("conversationId") or ""
+            subject = msg.get("subject") or ""
+            
+            body_dict = msg.get("body") or {}
+            html_body = body_dict.get("content") or ""
+            
+            # Derive plain text body
+            if html_body:
+                try:
+                    soup = BeautifulSoup(html_body, "html.parser")
+                    plain_body = soup.get_text()
+                except Exception:
+                    plain_body = html_body
+            else:
+                plain_body = ""
+                
+            from_dict = msg.get("from") or {}
+            from_address_dict = from_dict.get("emailAddress") or {}
+            from_email = from_address_dict.get("address") or ""
+            from_name = from_address_dict.get("name")
+            
+            to_recipients = []
+            for to_rec in (msg.get("toRecipients") or []):
+                addr = to_rec.get("emailAddress", {}).get("address")
+                if addr:
+                    to_recipients.append(addr)
+                    
+            cc_recipients = []
+            for cc_rec in (msg.get("ccRecipients") or []):
+                addr = cc_rec.get("emailAddress", {}).get("address")
+                if addr:
+                    cc_recipients.append(addr)
+                    
+            received_str = msg.get("receivedDateTime")
+            received_at = datetime.now(timezone.utc)
+            if received_str:
+                try:
+                    received_at = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+                    
+            has_attachments = msg.get("hasAttachments", False)
+            
+            references = None
+            in_reply_to = None
+            for prop in msg.get("singleValueExtendedProperties", []):
+                if prop.get("id") == "String 0x1039":
+                    references = prop.get("value")
+                elif prop.get("id") == "String 0x1042":
+                    in_reply_to = prop.get("value")
+                    
+            normalized_messages.append(
+                InboundMessage(
+                    provider_message_id=provider_msg_id,
+                    internet_message_id=internet_msg_id,
+                    provider="microsoft",
+                    conversation_id=conversation_id,
+                    thread_id=conversation_id,
+                    subject=subject,
+                    html_body=html_body,
+                    plain_text_body=plain_body,
+                    from_email=from_email,
+                    from_name=from_name,
+                    to_recipients=to_recipients,
+                    cc_recipients=cc_recipients,
+                    received_at=received_at,
+                    has_attachments=has_attachments,
+                    attachments=[],
+                    in_reply_to=in_reply_to,
+                    references=references
+                )
+            )
+            
+        return InboundSyncResult(
+            messages=normalized_messages,
+            new_cursor=new_delta_link,
+            provider="microsoft"
+        )

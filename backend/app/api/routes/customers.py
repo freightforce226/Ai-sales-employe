@@ -137,6 +137,7 @@ async def update_customer(
     )
     if not customer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
+    await db.commit()
     return CustomerResponse(**customer)
 
 
@@ -150,6 +151,7 @@ async def delete_customer(
     success = await service.delete_customer(id)
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
+    await db.commit()
     return {"success": True}
 
 
@@ -161,4 +163,5 @@ async def bulk_delete_customers(
 ):
     service = CustomerService(db, current_user.organization_id)
     deleted_count = await service.bulk_delete_customers(request.ids)
+    await db.commit()
     return {"success": True, "deleted_count": deleted_count}

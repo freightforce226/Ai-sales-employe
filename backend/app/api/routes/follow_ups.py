@@ -645,86 +645,62 @@ async def start_scheduled_followup_execution(
 ):
     org_id = payload.organization_id
 
-    # 1. Concurrency Check: Find any active execution
-    active_res = await db.execute(
-        text("""
-            SELECT id, workflow_execution_id, status, started_at, total_customers 
-            FROM follow_up_executions 
-            WHERE organization_id = :org_id 
-              AND status IN ('pending', 'started', 'running')
-            ORDER BY started_at DESC
-            LIMIT 1
-        """),
-        {"org_id": org_id}
-    )
-    active_row = active_res.fetchone()
-    if active_row:
-        return FollowUpScheduledStartResponse(
-            already_running=True,
-            execution_id=active_row[0],
-            workflow_execution_id=active_row[1],
-            status=active_row[2],
-            started_at=active_row[3].isoformat() if active_row[3] else "",
-            total_customers=active_row[4]
+    try:
+        res = await db.execute(
+            text("""
+                SELECT already_running, execution_id, workflow_execution_id, status, started_at, total_customers 
+                FROM public.start_followup_execution(
+                    p_organization_id := :org_id,
+                    p_workflow_execution_id := :wf_id,
+                    p_trigger_type := :trigger_type,
+                    p_started_by_user := NULL
+                )
+            """),
+            {
+                "org_id": org_id,
+                "wf_id": payload.workflow_execution_id,
+                "trigger_type": payload.trigger_type
+            }
         )
-
-    # 2. Validate organization
-    org_check = await db.execute(
-        text("SELECT 1 FROM organizations WHERE id = :org_id"),
-        {"org_id": org_id}
-    )
-    if not org_check.fetchone():
-        raise HTTPException(status_code=404, detail="Organization not found.")
-
-    # 3. Calculate due followups count via SQL
-    count_res = await db.execute(
-        text("""
-            SELECT COUNT(*) 
-            FROM follow_up_schedule f
-            JOIN customers c ON f.customer_id = c.id
-            WHERE f.organization_id = :org_id 
-              AND f.draft_status = 'scheduled'
-              AND f.scheduled_datetime <= NOW()
-              AND c.deleted_at IS NULL
-        """),
-        {"org_id": org_id}
-    )
-    total_customers = count_res.scalar() or 0
-
-    # 4. Insert new execution record
-    execution_id = uuid.uuid4()
-    started_at_now = await db.execute(text("SELECT NOW()"))
-    started_at = started_at_now.scalar()
-    
-    await db.execute(
-        text("""
-            INSERT INTO follow_up_executions (
-                id, organization_id, workflow_execution_id, trigger_type, status, started_at,
-                total_customers, processed, sent, failed, skipped
-            ) VALUES (
-                :id, :org_id, :workflow_execution_id, :trigger_type, 'started', :started_at,
-                :total_customers, 0, 0, 0, 0
+        row = res.fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail="Failed to initialize scheduled execution.")
+        
+        already_running, execution_id, workflow_execution_id, execution_status, started_at, total_customers = row
+        await db.commit()
+        return FollowUpScheduledStartResponse(
+            already_running=already_running,
+            execution_id=execution_id,
+            workflow_execution_id=workflow_execution_id,
+            status=execution_status,
+            started_at=started_at.isoformat() if started_at else "",
+            total_customers=total_customers
+        )
+    except Exception as e:
+        await db.rollback()
+        # Fallback check in case of concurrent insert race raising unique constraint
+        active_res = await db.execute(
+            text("""
+                SELECT id, workflow_execution_id, status, started_at, total_customers 
+                FROM follow_up_executions 
+                WHERE organization_id = :org_id 
+                  AND status IN ('pending', 'started', 'running')
+                ORDER BY started_at DESC
+                LIMIT 1
+            """),
+            {"org_id": org_id}
+        )
+        active_row = active_res.fetchone()
+        if active_row:
+            return FollowUpScheduledStartResponse(
+                already_running=True,
+                execution_id=active_row[0],
+                workflow_execution_id=active_row[1],
+                status=active_row[2],
+                started_at=active_row[3].isoformat() if active_row[3] else "",
+                total_customers=active_row[4]
             )
-        """),
-        {
-            "id": execution_id,
-            "org_id": org_id,
-            "workflow_execution_id": payload.workflow_execution_id,
-            "trigger_type": payload.trigger_type,
-            "started_at": started_at,
-            "total_customers": total_customers
-        }
-    )
-    await db.commit()
-
-    return FollowUpScheduledStartResponse(
-        already_running=False,
-        execution_id=execution_id,
-        workflow_execution_id=payload.workflow_execution_id,
-        status="started",
-        started_at=started_at.isoformat() if started_at else "",
-        total_customers=total_customers
-    )
+        raise HTTPException(status_code=500, detail=f"Database error starting execution: {str(e)}")
 
 
 @router.post("/executions/{execution_id}/complete", dependencies=[Depends(verify_api_key)])
