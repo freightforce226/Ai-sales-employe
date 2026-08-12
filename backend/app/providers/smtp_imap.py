@@ -28,7 +28,18 @@ def is_transient_smtp_error(exception: Exception) -> bool:
         "credentials" in e_str or
         "535" in e_str
     )
-    return not is_auth_error
+    is_recipient_or_perm_error = (
+        isinstance(exception, smtplib.SMTPRecipientsRefused) or
+        isinstance(exception, smtplib.SMTPSenderRefused) or
+        "550" in e_str or
+        "551" in e_str or
+        "552" in e_str or
+        "553" in e_str or
+        "554" in e_str or
+        "recipient rejected" in e_str or
+        "mailbox unavailable" in e_str
+    )
+    return not (is_auth_error or is_recipient_or_perm_error)
 
 class SmtpImapProvider(BaseEmailProvider):
     async def _get_smtp_settings(self, org_id: UUID, db_session: AsyncSession) -> Dict[str, Any]:

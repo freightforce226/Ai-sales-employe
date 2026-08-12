@@ -88,6 +88,8 @@ export default function CSVImportPage() {
   const [allParsedRows, setAllParsedRows] = useState<string[][]>([]);
   const [headerRowIndex, setHeaderRowIndex] = useState<number>(0);
   const [savedTemplates, setSavedTemplates] = useState<any[]>([]);
+  const [sheetNames, setSheetNames] = useState<string[]>([]);
+  const [selectedSheet, setSelectedSheet] = useState<string>('');
 
   // Poll status interval references
   const [isPolling, setIsPolling] = useState(false);
@@ -118,13 +120,64 @@ export default function CSVImportPage() {
     }
   };
 
+  const uploadFileAndGetHeaders = async (selectedFile: File, chosenSheetName = '') => {
+    try {
+      setIsUploading(true);
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+      formData.append('header_row', '0');
+      if (chosenSheetName) {
+        formData.append('sheet_name', chosenSheetName);
+      }
+      const res = await api.post('/api/v1/import/upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      });
+      setUploadUrl(res.data.storage_path);
+      if (res.data.headers) {
+        setCsvHeaders(res.data.headers);
+        applyMappingTemplateOrGuess(res.data.headers, savedTemplates);
+      }
+      if (res.data.all_rows_preview) {
+        setAllParsedRows(res.data.all_rows_preview);
+        const index = res.data.header_row_used ?? 0;
+        setHeaderRowIndex(index);
+        const previewRows = res.data.all_rows_preview.slice(index + 1, index + 6)
+          .filter((row: any) => row.length > 0);
+        setCsvPreviewRows(previewRows);
+      }
+      if (res.data.sheet_names) {
+        setSheetNames(res.data.sheet_names);
+        if (res.data.sheet_names.length > 0) {
+          setSelectedSheet(chosenSheetName || res.data.sheet_names[0]);
+        }
+      }
+    } catch (err) {
+      const error = err as AxiosErrorLike;
+      alert(error.response?.data?.detail || 'Failed to detect headers from file.');
+      setFile(null);
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const handleSheetChange = async (sheetName: string) => {
+    setSelectedSheet(sheetName);
+    if (file) {
+      await uploadFileAndGetHeaders(file, sheetName);
+    }
+  };
+
   // Step 1: Handle file drop & reading headers locally
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const selectedFile = e.target.files[0];
-      if (selectedFile.name.endsWith('.csv')) {
+      const allowedExts = ['.csv', '.tsv', '.txt', '.xlsx', '.xls', '.xlsm'];
+      const fileExt = selectedFile.name.substring(selectedFile.name.lastIndexOf('.')).toLowerCase();
+      if (allowedExts.includes(fileExt)) {
         setFile(selectedFile);
-        parseHeadersLocally(selectedFile);
+        uploadFileAndGetHeaders(selectedFile);
+      } else {
+        alert("Unsupported file format. Please upload CSV, TSV, TXT, XLS, XLSX, or XLSM.");
       }
     }
   };
@@ -339,10 +392,17 @@ export default function CSVImportPage() {
       const formData = new FormData();
       formData.append('file', file);
       formData.append('header_row', String(headerRowIndex));
+      if (selectedSheet) {
+        formData.append('sheet_name', selectedSheet);
+      }
       const res = await api.post('/api/v1/import/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
       setUploadUrl(res.data.storage_path);
+      if (res.data.headers) {
+        setCsvHeaders(res.data.headers);
+        applyMappingTemplateOrGuess(res.data.headers, savedTemplates);
+      }
       setStep(2);
     } catch (err) {
       const error = err as AxiosErrorLike;
@@ -503,14 +563,14 @@ export default function CSVImportPage() {
                     <Upload className="w-8 h-8" />
                   </div>
                   <div className="space-y-1.5">
-                    <h3 className="text-sm font-bold text-text-primary">Upload your Customer CSV</h3>
-                    <p className="text-xs text-text-muted">Accepts standard .csv containing contacts data</p>
+                    <h3 className="text-sm font-bold text-text-primary">Upload your Customer Data</h3>
+                    <p className="text-xs text-text-muted">Accepts CSV, TSV, TXT, XLS, XLSX, and XLSM files</p>
                   </div>
 
                   <div className="relative border border-dashed border-border-color rounded-xl p-6 bg-[#F8FAFC] hover:bg-slate-50 transition-colors">
                     <input 
                       type="file" 
-                      accept=".csv" 
+                      accept=".csv,.tsv,.txt,.xlsx,.xls,.xlsm" 
                       onChange={handleFileChange}
                       className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                     />
@@ -530,6 +590,20 @@ export default function CSVImportPage() {
 
                   {file && allParsedRows.length > 0 && (
                     <div className="mt-4 p-4 rounded-xl bg-slate-50 border border-border-color text-left space-y-3">
+                      {sheetNames.length > 1 && (
+                        <div className="flex items-center justify-between border-b border-border-color pb-3">
+                          <label className="text-xs font-bold text-text-secondary">Select Worksheet:</label>
+                          <select
+                            value={selectedSheet}
+                            onChange={(e) => handleSheetChange(e.target.value)}
+                            className="text-xs font-bold text-text-primary bg-bg-surface border border-border-color rounded-md px-2 py-1 focus:outline-none focus:ring-1 focus:ring-brand-primary cursor-pointer"
+                          >
+                            {sheetNames.map((name) => (
+                              <option key={name} value={name}>{name}</option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
                       <div className="flex items-center justify-between">
                         <label className="text-xs font-bold text-text-secondary">Detected Column Header Row:</label>
                         <div className="flex items-center space-x-2">

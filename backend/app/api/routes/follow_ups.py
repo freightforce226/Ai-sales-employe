@@ -1538,6 +1538,25 @@ async def complete_followup_schedule(
         reply_detected = reply_info["reply_detected"]
 
         async with db.begin_nested():
+            # Resolve actual sent_at from email_log to use as last_contact_date
+            sent_res = await db.execute(
+                text("SELECT sent_at FROM email_log WHERE graph_message_id = :msg_id AND organization_id = :org_id LIMIT 1"),
+                {"msg_id": payload.message_id, "org_id": organization_id}
+            )
+            sent_row = sent_res.fetchone()
+            sent_dt = sent_row[0] if sent_row else None
+
+            # Update customers.last_contact_date
+            await db.execute(
+                text("""
+                    UPDATE customers
+                    SET last_contact_date = COALESCE(:sent_dt, NOW())::date,
+                        updated_at = NOW()
+                    WHERE id = :cust_id AND organization_id = :org_id
+                """),
+                {"cust_id": customer_id, "org_id": organization_id, "sent_dt": sent_dt}
+            )
+
             # Update status, draft_status, completed_at, and message_id
             await db.execute(
                 text("""

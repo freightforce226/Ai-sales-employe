@@ -17,7 +17,14 @@ import {
   ChevronRight,
   MessageSquarePlus,
   Sparkles,
-  Database
+  Database,
+  UploadCloud,
+  Calendar,
+  ChevronUp,
+  ChevronDown,
+  FileText,
+  Cpu,
+  MessageSquare
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 
@@ -31,9 +38,22 @@ interface Lead {
 }
 
 interface ActivityItem {
+  id: string;
+  time: string;
+  timestamp: string;
   event: string;
   details: string;
-  time: string;
+  module: string;
+  event_type: string;
+  status: string;
+  title: string;
+  subtitle: string;
+  icon: string;
+  color: string;
+  expandable: boolean;
+  mail?: any;
+  attachments?: string[];
+  step_number?: number | null;
 }
 
 export default function DashboardPage() {
@@ -41,12 +61,47 @@ export default function DashboardPage() {
   const { isLoading, isTenantInitialized } = useAuth();
   const { branding } = useTenantStore();
   
+  const [expandedEvents, setExpandedEvents] = useState<Record<string, boolean>>({});
+  const [openSections, setOpenSections] = useState({
+    conversations: true,
+    outreach: true,
+    activity: true
+  });
+
+  const stripHtmlToPlainText = (html: string) => {
+    if (!html) return '';
+    let doc = html.replace(/<style([\s\S]*?)<\/style>/gi, '');
+    doc = doc.replace(/<script([\s\S]*?)<\/script>/gi, '');
+    doc = doc.replace(/<\/div>/ig, '\n');
+    doc = doc.replace(/<\/li>/ig, '\n');
+    doc = doc.replace(/<li>/ig, '  * ');
+    doc = doc.replace(/<\/p>/ig, '\n\n');
+    doc = doc.replace(/<br\s*\/?>/gi, '\n');
+    doc = doc.replace(/<[^>]+>/ig, '');
+    
+    const entities: Record<string, string> = {
+      'amp': '&', 'apos': "'", 'gt': '>', 'lt': '<', 'nbsp': ' ', 'quot': '"'
+    };
+    doc = doc.replace(/&(#(?:\d+|x[a-f0-9]+)|[a-z]+);/gi, (match, entity) => {
+      if (entity[0] === '#') {
+        const code = entity[1] === 'x' ? parseInt(entity.slice(2), 16) : parseInt(entity.slice(1), 10);
+        return String.fromCharCode(code);
+      }
+      return entities[entity.toLowerCase()] || match;
+    });
+    
+    return doc.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
+  };
+  
   // Real Database States
   const [metrics, setMetrics] = useState<{
     total_contacts: number;
     total_campaigns: number;
+    customers_under_automation: number;
     total_emails_sent: number;
     response_rate: string;
+    replies_received: number;
+    replies_today: number;
   } | null>(null);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [activities, setActivities] = useState<ActivityItem[]>([]);
@@ -132,6 +187,176 @@ export default function DashboardPage() {
     );
   }
 
+  const conversationEvents = activities.filter(act => 
+    ['reply_received', 'ai_reply_drafted', 'ai_reply_approved', 'ai_reply_sent', 'human_reply_sent'].includes(act.event_type)
+  );
+  const sortedConversationEvents = [...conversationEvents].sort((a, b) => 
+    new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+  );
+
+  const outreachEvents = activities.filter(act => 
+    ['csv_imported', 'email_sent', 'sequence_closed', 'sequence_finished', 'email_failed'].includes(act.event_type)
+  );
+  const sortedOutreachEvents = [...outreachEvents].sort((a, b) => 
+    new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+  );
+
+  const automationEvents = activities.filter(act => 
+    ['followup_scheduled', 'followup_pending_review', 'sequence_stopped', 'automation_paused', 'automation_resumed', 'cancelled', 'skipped', 'approved'].includes(act.event_type)
+  );
+  const sortedAutomationEvents = [...automationEvents].sort((a, b) => 
+    new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+  );
+
+  const renderLandscapeCard = (act: any, index: number) => {
+    const isExpanded = !!expandedEvents[act.id];
+    
+    // Color Mappings: Reply -> Soft Green, Email -> Blue, Approval -> Amber, Paused -> Orange, Cancelled -> Red, Finished -> Gray
+    let badgeColor = "bg-slate-50 text-slate-600 border-slate-200";
+    let statusText = act.mail?.delivery_status || act.event_type || "status";
+    
+    const eventType = act.event_type;
+    if (eventType === 'reply_received') {
+      badgeColor = "bg-emerald-50 text-emerald-700 border-emerald-200";
+      statusText = "Customer Reply";
+    } else if (['ai_reply_sent', 'human_reply_sent', 'email_sent'].includes(eventType)) {
+      badgeColor = "bg-blue-50 text-blue-700 border-blue-200";
+      statusText = "Email Sent";
+    } else if (eventType === 'email_failed') {
+      badgeColor = "bg-red-50 text-red-700 border-red-200";
+      statusText = "Failed";
+    } else if (eventType === 'ai_reply_drafted' || eventType === 'followup_pending_review') {
+      badgeColor = "bg-amber-50 text-amber-700 border-amber-200";
+      statusText = "Waiting for Approval";
+    } else if (['sequence_stopped', 'automation_paused'].includes(eventType)) {
+      badgeColor = "bg-orange-50 text-orange-700 border-orange-200";
+      statusText = "Paused";
+    } else if (['sequence_closed', 'sequence_finished', 'conversation_finished'].includes(eventType)) {
+      badgeColor = "bg-gray-50 text-gray-600 border-gray-200";
+      statusText = "Finished";
+    } else if (eventType === 'cancelled') {
+      badgeColor = "bg-red-50 text-red-700 border-red-200";
+      statusText = "Cancelled";
+    } else if (eventType === 'skipped') {
+      badgeColor = "bg-slate-50 text-slate-500 border-slate-200";
+      statusText = "Skipped";
+    } else if (eventType === 'followup_scheduled') {
+      badgeColor = "bg-indigo-50 text-indigo-700 border-indigo-200";
+      statusText = "Scheduled";
+    }
+
+    // Business wording substitutions for freight forwarders
+    const displayEvent = act.event
+      .replace("Sequence Stopped", "Automation Paused")
+      .replace("Sequence Finished", "Follow-up Finished")
+      .replace("Sequence", "Follow-up")
+      .replace("Automation Status", "Follow-up Status")
+      .replace("Automation Logs", "Follow-up Activity")
+      .replace("Sales Outreach", "Sales Emails");
+
+    const displayDetails = act.details
+      .replace("Sequence Stopped", "Automation Paused")
+      .replace("Sequence Finished", "Follow-up Finished")
+      .replace("Sequence", "Follow-up")
+      .replace("Automation Status", "Follow-up Status")
+      .replace("Automation Logs", "Follow-up Activity")
+      .replace("Sales Outreach", "Sales Emails");
+
+    // Icons mapping
+    let IconComponent = Mail;
+    if (eventType === 'reply_received') IconComponent = MessageSquare;
+    else if (['ai_reply_sent', 'human_reply_sent', 'email_sent'].includes(eventType)) IconComponent = Send;
+    else if (eventType === 'ai_reply_drafted' || eventType === 'followup_pending_review') IconComponent = Bot;
+    else if (['sequence_stopped', 'automation_paused', 'cancelled', 'skipped'].includes(eventType)) IconComponent = Cpu;
+    else IconComponent = Calendar;
+
+    // Extract customer / company info
+    let companyName = "System Event";
+    if (act.mail && act.mail.sender) {
+      companyName = act.mail.sender;
+    } else if (act.mail && act.mail.recipient) {
+      companyName = act.mail.recipient;
+    } else if (act.details) {
+      const emailMatches = act.details.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/);
+      if (emailMatches && emailMatches[1]) {
+        companyName = emailMatches[1];
+      }
+    }
+
+    return (
+      <div 
+        key={act.id || index}
+        onClick={() => act.expandable && setExpandedEvents(prev => ({ ...prev, [act.id]: !isExpanded }))}
+        className={`rounded-xl border border-border-color bg-bg-surface p-4 shadow-[0_1px_2px_rgba(0,0,0,0.05)] transition-all hover:shadow-md hover:border-border-color/80 flex flex-col justify-between gap-3 select-text ${act.expandable ? 'cursor-pointer' : ''} ${
+          eventType === 'reply_received' ? 'bg-emerald-500/5 border-emerald-500/20' : ''
+        }`}
+      >
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          {/* LEFT: Icon + Event Title + Company */}
+          <div className="flex items-center gap-3 min-w-[240px] md:max-w-[280px]">
+            <div className={`p-2 rounded-lg shrink-0 ${eventType === 'reply_received' ? 'bg-emerald-500/10 text-emerald-600' : 'bg-brand-primary/10 text-brand-primary'}`}>
+              <IconComponent className="w-4 h-4" />
+            </div>
+            <div className="space-y-0.5">
+              <h4 className="text-xs font-bold text-text-primary flex items-center gap-1.5">
+                {displayEvent}
+              </h4>
+              <p className="text-[10px] text-text-muted font-semibold truncate max-w-[200px]" title={companyName}>
+                {companyName}
+              </p>
+            </div>
+          </div>
+
+          {/* CENTER: Subject + Preview */}
+          <div className="flex-1 min-w-0">
+            {act.mail ? (
+              <div className="space-y-0.5">
+                <p className="text-[11px] font-bold text-text-primary truncate">
+                  {act.mail.subject}
+                </p>
+                <p className="text-[10px] text-text-secondary truncate max-w-[500px]">
+                  {stripHtmlToPlainText(act.mail.body)}
+                </p>
+              </div>
+            ) : (
+              <p className="text-[10px] text-text-secondary leading-normal truncate max-w-[500px]">
+                {displayDetails}
+              </p>
+            )}
+          </div>
+
+          {/* RIGHT: Time + Status Badge */}
+          <div className="flex items-center justify-between md:justify-end gap-4 min-w-[180px] shrink-0">
+            <span className="text-[10px] text-text-muted font-semibold font-mono">{act.time}</span>
+            <span className={`text-[9px] font-bold border px-2.5 py-1 rounded-full uppercase tracking-wider ${badgeColor}`}>
+              {statusText}
+            </span>
+          </div>
+        </div>
+
+        {act.expandable && isExpanded && act.mail && (
+          <div 
+            onClick={(e) => e.stopPropagation()}
+            className="mt-3 p-4 bg-bg-secondary/40 border border-border-color rounded-xl space-y-3 text-[11px] select-text cursor-default"
+          >
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-2xs border-b border-border-color/40 pb-2 mb-2">
+              <div><span className="text-text-muted">Sender Name:</span> <strong className="text-text-primary">{act.mail.sender}</strong></div>
+              <div><span className="text-text-muted">Recipient:</span> <strong className="text-text-primary">{act.mail.recipient}</strong></div>
+              <div><span className="text-text-muted">Subject:</span> <strong className="text-text-primary">{act.mail.subject}</strong></div>
+              <div><span className="text-text-muted">Communication Type:</span> <strong className="text-text-primary">{act.mail.email_type || act.event_type}</strong></div>
+              {act.step_number && <div><span className="text-text-muted">Sequence Step:</span> <strong className="text-text-primary">Step {act.step_number}</strong></div>}
+              <div><span className="text-text-muted">Sent Time:</span> <strong className="text-text-primary">{new Date(act.timestamp).toLocaleString()}</strong></div>
+              <div><span className="text-text-muted">Email Status:</span> <strong className="text-text-primary uppercase">{act.mail.delivery_status || 'completed'}</strong></div>
+            </div>
+            <div className="whitespace-pre-wrap text-text-secondary leading-relaxed font-sans max-h-[300px] overflow-y-auto pr-1 text-2xs">
+              {stripHtmlToPlainText(act.mail.body)}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <AppShell>
       <div className="p-4 sm:p-6 md:p-8 max-w-7xl mx-auto w-full space-y-6 sm:space-y-8">
@@ -151,7 +376,7 @@ export default function DashboardPage() {
                   style={{ backgroundColor: 'var(--brand-primary)' }}
                   className="w-12 h-12 rounded-xl flex items-center justify-center font-bold text-white text-xl shadow-md"
                 >
-                  {branding?.company_name.charAt(0) || 'F'}
+                  {branding?.company_name?.charAt(0) || 'F'}
                 </div>
               )}
               <div>
@@ -268,17 +493,17 @@ export default function DashboardPage() {
 
             <div className="bg-bg-surface p-5 rounded-xl border border-border-color shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] border-t-2 border-t-brand-primary flex flex-col justify-between hover:border-slate-300 transition-all duration-200">
               <div className="flex items-center justify-between">
-                <span className="text-[11px] font-bold text-text-muted uppercase tracking-[0.06em]">Campaigns Live</span>
+                <span className="text-[11px] font-bold text-text-muted uppercase tracking-[0.06em]">Under Automation</span>
                 <div className="p-2.5 rounded-xl bg-indigo-500/5 text-indigo-500">
                   <Send className="w-4.5 h-4.5" />
                 </div>
               </div>
               <div className="mt-4 flex items-baseline justify-between">
                 <span className="text-xl sm:text-2xl font-bold text-text-primary font-mono">
-                  {loadingMetrics ? '...' : metrics?.total_campaigns}
+                  {loadingMetrics ? '...' : metrics?.customers_under_automation}
                 </span>
                 <span className="text-[10px] sm:text-xs font-bold text-indigo-600 flex items-center gap-0.5">
-                  Pipeline
+                  In Sequence
                 </span>
               </div>
             </div>
@@ -302,18 +527,18 @@ export default function DashboardPage() {
 
             <div className="bg-bg-surface p-5 rounded-xl border border-border-color shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] border-t-2 border-t-brand-primary flex flex-col justify-between hover:border-slate-300 transition-all duration-200">
               <div className="flex items-center justify-between">
-                <span className="text-[11px] font-bold text-text-muted uppercase tracking-[0.06em]">Reply Rate (7-day)</span>
+                <span className="text-[11px] font-bold text-text-muted uppercase tracking-[0.06em]">Replies Received</span>
                 <div className="p-2.5 rounded-xl bg-emerald-500/5 text-emerald-500">
                   <BarChart3 className="w-4.5 h-4.5" />
                 </div>
               </div>
               <div className="mt-4 flex items-baseline justify-between">
                 <span className="text-xl sm:text-2xl font-bold text-text-primary font-mono">
-                  {loadingMetrics ? '...' : metrics?.response_rate}
+                  {loadingMetrics ? '...' : metrics?.replies_received}
                 </span>
                 <span className="text-[10px] sm:text-xs font-bold text-emerald-600 flex items-center gap-0.5">
                   <TrendingUp className="w-3 h-3" />
-                  Conversion
+                  +{metrics?.replies_today} today ({metrics?.response_rate})
                 </span>
               </div>
             </div>
@@ -322,37 +547,120 @@ export default function DashboardPage() {
           {/* ZONE 4 — Two-Column Content Area */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             
-            {/* LEFT (2/3): Agent Activity Timeline */}
-            <div className="bg-bg-surface p-5 sm:p-6 rounded-xl border border-border-color shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] flex flex-col h-full lg:col-span-2 space-y-4">
-              <div className="flex items-center justify-between pb-2 border-b border-border-color">
+            {/* LEFT (2/3): Workcenter Activity Dashboard */}
+            <div className="bg-bg-surface p-5 sm:p-6 rounded-xl border border-border-color shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] flex flex-col lg:col-span-2 space-y-6">
+              <div className="flex items-center justify-between pb-3 border-b border-border-color">
                 <h2 className="text-base font-bold text-text-primary flex items-center space-x-2">
                   <Layers className="w-5 h-5 text-brand-primary" />
-                  <span>Agent Activity Timeline</span>
+                  <span>Activity Workcenter</span>
                 </h2>
                 <span className="text-[10px] font-bold text-brand-primary bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-md">
-                  Live Stream
+                  Real-time Stream
                 </span>
               </div>
 
-              <div className="flex-1 divide-y divide-border-color/60 overflow-y-auto max-h-[320px] pr-2">
-                {loadingMetrics ? (
-                  <div className="py-8 text-center text-xs text-text-muted font-semibold">Loading logs...</div>
-                ) : activities.length === 0 ? (
-                  <div className="py-8 text-center text-xs text-text-muted font-medium">No campaign activity recorded yet.</div>
-                ) : (
-                  activities.map((act, index) => (
-                    <div key={index} className="py-3.5 flex justify-between items-start gap-4">
-                      <div className="space-y-1">
-                        <p className="text-xs font-bold text-text-primary flex items-center gap-1.5">
-                          <span className="w-1.5 h-1.5 rounded-full bg-brand-primary animate-pulse"></span>
-                          {act.event}
-                        </p>
-                        <p className="text-xs text-text-secondary font-medium pl-3">{act.details}</p>
-                      </div>
-                      <span className="text-[10px] text-text-muted font-semibold shrink-0 font-mono">{act.time}</span>
+              <div className="space-y-6">
+                {/* 1. Customer Conversations */}
+                <div className="space-y-3">
+                  <h3 
+                    onClick={() => {
+                      if (typeof window !== 'undefined' && window.innerWidth < 768) {
+                        setOpenSections(prev => ({ ...prev, conversations: !prev.conversations }));
+                      }
+                    }}
+                    className="text-xs font-bold text-emerald-600 flex items-center justify-between border-b border-emerald-100 pb-2 cursor-pointer md:cursor-default select-none"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <MessageSquare className="w-4 h-4" />
+                      <span>Customer Conversations</span>
                     </div>
-                  ))
-                )}
+                    <div className="md:hidden">
+                      {openSections.conversations ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </div>
+                  </h3>
+                  
+                  {openSections.conversations && (
+                    <div className="space-y-2.5 max-h-[300px] overflow-y-auto pr-1">
+                      {loadingMetrics ? (
+                        <div className="py-4 text-center text-2xs text-text-muted font-semibold">Loading...</div>
+                      ) : sortedConversationEvents.length === 0 ? (
+                        <div className="py-6 text-center text-2xs text-text-muted italic bg-bg-secondary/30 rounded-xl border border-dashed border-border-color">
+                          No customer conversations yet. Customer replies will appear here.
+                        </div>
+                      ) : (
+                        sortedConversationEvents.map((act, idx) => renderLandscapeCard(act, idx))
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* 2. Sales Emails */}
+                <div className="space-y-3">
+                  <h3 
+                    onClick={() => {
+                      if (typeof window !== 'undefined' && window.innerWidth < 768) {
+                        setOpenSections(prev => ({ ...prev, outreach: !prev.outreach }));
+                      }
+                    }}
+                    className="text-xs font-bold text-brand-primary flex items-center justify-between border-b border-blue-100 pb-2 cursor-pointer md:cursor-default select-none"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <Send className="w-4 h-4" />
+                      <span>Sales Emails</span>
+                    </div>
+                    <div className="md:hidden">
+                      {openSections.outreach ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </div>
+                  </h3>
+                  
+                  {openSections.outreach && (
+                    <div className="space-y-2.5 max-h-[300px] overflow-y-auto pr-1">
+                      {loadingMetrics ? (
+                        <div className="py-4 text-center text-2xs text-text-muted font-semibold">Loading...</div>
+                      ) : sortedOutreachEvents.length === 0 ? (
+                        <div className="py-6 text-center text-2xs text-text-muted italic bg-bg-secondary/30 rounded-xl border border-dashed border-border-color">
+                          No sales emails recorded.
+                        </div>
+                      ) : (
+                        sortedOutreachEvents.map((act, idx) => renderLandscapeCard(act, idx))
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* 3. Follow-up Activity */}
+                <div className="space-y-3">
+                  <h3 
+                    onClick={() => {
+                      if (typeof window !== 'undefined' && window.innerWidth < 768) {
+                        setOpenSections(prev => ({ ...prev, activity: !prev.activity }));
+                      }
+                    }}
+                    className="text-xs font-bold text-indigo-600 flex items-center justify-between border-b border-indigo-100 pb-2 cursor-pointer md:cursor-default select-none"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <Cpu className="w-4 h-4" />
+                      <span>Follow-up Activity</span>
+                    </div>
+                    <div className="md:hidden">
+                      {openSections.activity ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </div>
+                  </h3>
+                  
+                  {openSections.activity && (
+                    <div className="space-y-2.5 max-h-[300px] overflow-y-auto pr-1">
+                      {loadingMetrics ? (
+                        <div className="py-4 text-center text-2xs text-text-muted font-semibold">Loading...</div>
+                      ) : sortedAutomationEvents.length === 0 ? (
+                        <div className="py-6 text-center text-2xs text-text-muted italic bg-bg-secondary/30 rounded-xl border border-dashed border-border-color">
+                          No follow-up activity yet.
+                        </div>
+                      ) : (
+                        sortedAutomationEvents.map((act, idx) => renderLandscapeCard(act, idx))
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 

@@ -14,13 +14,11 @@ from app.core.config import get_settings
 settings = get_settings()
 
 import logging
-logging.getLogger("sqlalchemy.engine").setLevel(
-    logging.INFO if settings.log_level.upper() == "DEBUG" else logging.WARNING
-)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 engine = create_async_engine(
     settings.database_url,
-    echo=(settings.log_level.upper() == "DEBUG"),
+    echo=False,
     future=True,
     pool_pre_ping=True,
     pool_size=20,

@@ -283,6 +283,19 @@ class InboundSyncService:
             "references": references,
             "in_reply_to": in_reply_to
         })
+
+        # Update last_contact_date on customers table using received_at timestamp
+        await self.db.execute(text("""
+            UPDATE customers
+            SET last_contact_date = :received_at::date,
+                updated_at = NOW()
+            WHERE id = :cust_id AND organization_id = :org_id
+        """), {
+            "received_at": received_at,
+            "cust_id": customer_id,
+            "org_id": org_id
+        })
+
         logger.info("INSTRUMENT: Database insert executed. Committing...")
         await self.db.commit()
         logger.info("INSTRUMENT: Database commit successful.")
@@ -421,6 +434,17 @@ class InboundSyncService:
         if matched:
             logger.info("Reply matching success", reason=reason, customer_id=str(customer_id))
             res_dict["matched"] = True
+
+            # Update replied_at on original outbound email in email_log
+            if matched_outbound:
+                await self.db.execute(text("""
+                    UPDATE email_log
+                    SET replied_at = :received_at
+                    WHERE id = :outbound_id
+                """), {
+                    "received_at": received_at,
+                    "outbound_id": matched_outbound[0]
+                })
 
             # Find if there is an active follow-up schedule item for this customer
             sched_res = await self.db.execute(text("""

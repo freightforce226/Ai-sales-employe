@@ -14,7 +14,21 @@ class CustomerService:
             return "NOT_ELIGIBLE"
         return "READY"
 
-    def calculate_status(self) -> str:
+    def calculate_status(self, enrollment_status: Optional[str], exit_reason: Optional[str]) -> str:
+        if not enrollment_status:
+            return "NOT_CONTACTED"
+        status_upper = enrollment_status.upper()
+        if status_upper == "ACTIVE":
+            return "ACTIVE"
+        if status_upper == "PAUSED":
+            return "PAUSED"
+        if status_upper == "COMPLETED":
+            reason_lower = (exit_reason or "").lower()
+            if "reply" in reason_lower:
+                return "EXITED_REPLIED"
+            if "unsubscribe" in reason_lower:
+                return "EXITED_UNSUBSCRIBED"
+            return "COMPLETED"
         return "NOT_CONTACTED"
 
     async def get_customers(
@@ -29,9 +43,9 @@ class CustomerService:
         rows, total = await self.repo.get_customers(page, limit, q, industry, country, segment)
         customers = []
         for r in rows:
-            c_id, company, name, email, ind, cntry, seg, last_email_date, created_at = r
+            c_id, company, name, email, ind, cntry, seg, last_email_date, created_at, enrollment_status, exit_reason = r
             readiness = self.calculate_readiness(email, company)
-            status_val = self.calculate_status()
+            status_val = self.calculate_status(enrollment_status, exit_reason)
 
             customers.append({
                 "id": c_id,
@@ -53,9 +67,9 @@ class CustomerService:
         if not row:
             return None
 
-        c_id, company, name, email, ind, cntry, seg, last_email_date, created_at, batch_id, batch_name, batch_date = row
+        c_id, company, name, email, ind, cntry, seg, last_email_date, created_at, batch_id, batch_name, batch_date, enrollment_status, exit_reason = row
         readiness = self.calculate_readiness(email, company)
-        status_val = self.calculate_status()
+        status_val = self.calculate_status(enrollment_status, exit_reason)
 
         # Query database for engagement timeline and stats
         from sqlalchemy import text
@@ -91,11 +105,7 @@ class CustomerService:
         last_delivery_status = str(latest_row[1]) if latest_row and latest_row[1] is not None else None
         last_message_id = latest_row[2] if latest_row else None
         
-        # Determine contact status
-        if latest_row:
-            status_val = "CONTACTED"
-            if latest_row[1] == "BOUNCED":
-                status_val = "PAUSED"
+
 
         # 5. Timeline list
         timeline_res = await self.repo.db.execute(

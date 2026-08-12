@@ -16,7 +16,17 @@ import {
   Check, 
   Send,
   Loader2,
-  AlertCircle
+  AlertCircle,
+  Mail,
+  Calendar,
+  CheckCircle,
+  FileText,
+  Sparkles,
+  Clock,
+  ChevronDown,
+  ChevronUp,
+  Users,
+  Layers
 } from 'lucide-react';
 import { Alert } from '../../components/ui/feedback';
 import { ConfirmationModal } from '../../components/ui/confirmation-modal';
@@ -67,6 +77,48 @@ interface Stats {
   segment_breakdown: Record<string, number>;
   country_breakdown: Record<string, number>;
 }
+
+const getEventIcon = (type: string) => {
+  switch (type) {
+    case 'csv_imported': return <Building className="w-3.5 h-3.5" />;
+    case 'email_sent':
+    case 'followup_sent': return <Send className="w-3.5 h-3.5" />;
+    case 'email_failed': return <AlertCircle className="w-3.5 h-3.5" />;
+    case 'followup_scheduled': return <Calendar className="w-3.5 h-3.5" />;
+    case 'reply_received': return <Mail className="w-3.5 h-3.5" />;
+    case 'sequence_stopped': return <X className="w-3.5 h-3.5" />;
+    default: return <Clock className="w-3.5 h-3.5" />;
+  }
+};
+
+const getEventColorClasses = (color: string) => {
+  switch (color) {
+    case 'blue': return 'text-blue-600 bg-blue-50 border-blue-200';
+    case 'emerald': return 'text-emerald-600 bg-emerald-50 border-emerald-200';
+    case 'red': return 'text-rose-600 bg-rose-50 border-rose-200';
+    case 'indigo': return 'text-indigo-600 bg-indigo-50 border-indigo-200';
+    case 'violet': return 'text-violet-600 bg-violet-50 border-violet-200';
+    default: return 'text-slate-600 bg-slate-50 border-slate-200';
+  }
+};
+
+const stripHtmlToPlainText = (html: string) => {
+  if (!html) return '';
+  if (!html.includes('<') && !html.includes('>')) return html;
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    let txt = doc.body.textContent || doc.body.innerText || '';
+    txt = txt.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    txt = txt.replace(/\n{3,}/g, '\n\n');
+    return txt.trim();
+  } catch (e) {
+    let cleaned = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+    cleaned = cleaned.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+    cleaned = cleaned.replace(/<[^>]+>/g, '\n');
+    cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+    return cleaned.trim();
+  }
+};
 
 export default function CustomersPage() {
   const router = useRouter();
@@ -127,6 +179,12 @@ export default function CustomersPage() {
     country: ''
   });
   const [savingEdit, setSavingEdit] = useState(false);
+  
+  // Customer Journey States
+  const [activeTab, setActiveTab] = useState<'overview' | 'journey'>('overview');
+  const [journeyTimeline, setJourneyTimeline] = useState<any[]>([]);
+  const [loadingJourney, setLoadingJourney] = useState(false);
+  const [expandedEvents, setExpandedEvents] = useState<Record<string, boolean>>({});
 
   // Modal states
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
@@ -274,6 +332,9 @@ export default function CustomersPage() {
     setLoadingDetails(true);
     setIsEditing(false);
     setSelectedCustomer(null);
+    setActiveTab('overview');
+    setJourneyTimeline([]);
+    setExpandedEvents({});
     try {
       const res = await api.get(`/api/v1/customers/${customer.id}`);
       const detail: CustomerDetail = res.data;
@@ -285,10 +346,16 @@ export default function CustomersPage() {
         industry: detail.industry || '',
         country: detail.country || ''
       });
+      
+      // Fetch Journey
+      setLoadingJourney(true);
+      const journeyRes = await api.get(`/api/v1/customers/${customer.id}/journey`);
+      setJourneyTimeline(journeyRes.data.timeline || []);
     } catch {
-      console.error('Failed to fetch customer detail details');
+      console.error('Failed to fetch customer detail details or journey');
     } finally {
       setLoadingDetails(false);
+      setLoadingJourney(false);
     }
   };
 
@@ -363,7 +430,8 @@ export default function CustomersPage() {
           />
         </div>
       )}
-      <div className="p-4 sm:p-6 md:p-8 max-w-7xl mx-auto w-full space-y-6 sm:space-y-8">
+      {!drawerOpen ? (
+        <div className="p-4 sm:p-6 md:p-8 max-w-7xl mx-auto w-full space-y-6 sm:space-y-8">
         
         {/* Header section */}
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between pb-6 border-b border-border-color gap-4">
@@ -651,281 +719,393 @@ export default function CustomersPage() {
           )}
         </div>
       </div>
+      ) : (
+        <div className="p-4 sm:p-6 md:p-8 max-w-7xl mx-auto w-full space-y-6 sm:space-y-8 select-text">
+          {/* Breadcrumb */}
+          <div className="flex items-center space-x-2 text-xs font-semibold text-text-secondary select-none">
+            <button 
+              onClick={() => setDrawerOpen(false)} 
+              className="hover:text-brand-primary cursor-pointer bg-transparent border-0 font-bold"
+            >
+              Customers
+            </button>
+            <span className="text-text-muted">/</span>
+            <span className="text-text-primary font-bold">
+              {selectedCustomer?.company_name || 'Loading Profile...'}
+            </span>
+          </div>
 
-      {/* Customer Drawer Overlay */}
-      {drawerOpen && (
-        <div className="fixed inset-0 z-50 flex justify-end">
-          {/* Backdrop */}
-          <div 
-            onClick={() => setDrawerOpen(false)}
-            className="absolute inset-0 bg-black/35 backdrop-blur-xs transition-opacity duration-200" 
-          />
-
-          {/* Panel */}
-          <div className="relative w-full max-w-md bg-white h-full shadow-2xl flex flex-col z-50 border-l border-border-color animate-slide-in">
-            {/* Header */}
-            <div className="p-5 border-b border-border-color flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <div className="w-8 h-8 rounded-lg bg-brand-primary/10 text-brand-primary flex items-center justify-center font-bold">
-                  <Building className="w-4.5 h-4.5" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-text-primary">Customer Profile</h3>
-                  <p className="text-[10px] text-text-muted font-medium">BFF Workflow Workspace</p>
-                </div>
-              </div>
-              <button 
-                onClick={() => setDrawerOpen(false)}
-                className="p-1.5 hover:bg-bg-secondary rounded-lg text-slate-400 hover:text-slate-600 transition-colors cursor-pointer"
-              >
-                <X className="w-4.5 h-4.5" />
-              </button>
+          {loadingDetails ? (
+            <div className="flex flex-col items-center justify-center py-20 space-y-3">
+              <Loader2 className="w-8 h-8 animate-spin text-brand-primary" />
+              <span className="text-xs font-semibold text-text-muted">Loading workspace details...</span>
             </div>
-
-            {/* Content Body */}
-            <div className="flex-1 overflow-y-auto p-6 space-y-6">
-              {loadingDetails ? (
-                <div className="flex flex-col items-center justify-center py-20 space-y-3">
-                  <Loader2 className="w-8 h-8 animate-spin text-brand-primary" />
-                  <span className="text-xs font-semibold text-text-muted">Loading details...</span>
-                </div>
-              ) : selectedCustomer ? (
-                <>
-                  {/* Status / Readiness Row */}
-                  <div className="flex items-center justify-between p-3.5 bg-bg-secondary rounded-xl border border-border-color">
-                    <div className="space-y-1">
-                      <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Workflow Status</span>
+          ) : selectedCustomer ? (
+            <>
+              {/* Customer Header */}
+              <div className="bg-bg-surface p-5 sm:p-6 rounded-xl border border-border-color shadow-sm space-y-4">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider block">Customer Workspace</span>
+                    <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-text-primary">
+                      {selectedCustomer.company_name}
+                    </h1>
+                    <p className="text-xs sm:text-sm text-text-secondary font-medium font-mono">
+                      {selectedCustomer.contact_email} • {selectedCustomer.contact_name}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="text-xs font-semibold text-text-secondary">
+                      <span className="text-text-muted mr-1.5 font-bold uppercase tracking-wider text-[10px]">Sequence:</span>
                       {getStatusBadge(selectedCustomer.status)}
                     </div>
-                    <div className="space-y-1 text-right">
-                      <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Readiness Code</span>
+                    <div className="text-xs font-semibold text-text-secondary">
+                      <span className="text-text-muted mr-1.5 font-bold uppercase tracking-wider text-[10px]">Readiness:</span>
                       {getReadinessBadge(selectedCustomer.engagement_readiness)}
                     </div>
                   </div>
-
-                  {/* Fields Form or View */}
-                  <div className="space-y-4">
-                    <div className="flex justify-between items-center pb-2 border-b border-border-color/60">
-                      <h4 className="text-xs font-bold text-text-primary uppercase tracking-wider">Properties</h4>
-                      {!isEditing ? (
-                        <button
-                          onClick={() => setIsEditing(true)}
-                          className="text-[10px] font-bold text-brand-primary hover:text-brand-primary-hover flex items-center gap-1 cursor-pointer bg-transparent border-0"
-                        >
-                          <Edit2 className="w-3 h-3" />
-                          <span>Edit</span>
-                        </button>
-                      ) : (
-                        <div className="flex items-center space-x-2">
-                          <button
-                            onClick={handleSaveEdit}
-                            disabled={savingEdit}
-                            className="text-[10px] font-bold text-emerald-600 hover:text-emerald-700 flex items-center gap-1 cursor-pointer bg-transparent border-0"
-                          >
-                            {savingEdit ? '...' : <Check className="w-3.5 h-3.5" />}
-                            <span>Save</span>
-                          </button>
-                          <button
-                            onClick={() => setIsEditing(false)}
-                            className="text-[10px] font-bold text-rose-500 hover:text-rose-600 cursor-pointer bg-transparent border-0"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="space-y-4">
-                      {/* Company Name */}
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Company</label>
-                        {isEditing ? (
-                          <input
-                            type="text"
-                            value={editForm.company_name}
-                            onChange={(e) => setEditForm(prev => ({ ...prev, company_name: e.target.value }))}
-                            className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold"
-                          />
-                        ) : (
-                          <p className="text-xs font-bold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
-                            {selectedCustomer.company_name}
-                          </p>
-                        )}
-                      </div>
-
-                      {/* Contact Name */}
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Contact Person</label>
-                        {isEditing ? (
-                          <input
-                            type="text"
-                            value={editForm.contact_name}
-                            onChange={(e) => setEditForm(prev => ({ ...prev, contact_name: e.target.value }))}
-                            className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold"
-                          />
-                        ) : (
-                          <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
-                            {selectedCustomer.contact_name || '—'}
-                          </p>
-                        )}
-                      </div>
-
-                      {/* Contact Email */}
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Contact Email</label>
-                        {isEditing ? (
-                          <input
-                            type="text"
-                            value={editForm.contact_email}
-                            onChange={(e) => setEditForm(prev => ({ ...prev, contact_email: e.target.value }))}
-                            className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold font-mono"
-                          />
-                        ) : (
-                          <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40 font-mono">
-                            {selectedCustomer.contact_email || '—'}
-                          </p>
-                        )}
-                      </div>
-
-                      {/* Industry */}
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Industry</label>
-                        {isEditing ? (
-                          <input
-                            type="text"
-                            value={editForm.industry}
-                            onChange={(e) => setEditForm(prev => ({ ...prev, industry: e.target.value }))}
-                            className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold"
-                          />
-                        ) : (
-                          <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
-                            {selectedCustomer.industry || '—'}
-                          </p>
-                        )}
-                      </div>
-
-                      {/* Country */}
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Country</label>
-                        {isEditing ? (
-                          <input
-                            type="text"
-                            value={editForm.country}
-                            onChange={(e) => setEditForm(prev => ({ ...prev, country: e.target.value }))}
-                            className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold"
-                          />
-                        ) : (
-                          <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
-                            {selectedCustomer.country || '—'}
-                          </p>
-                        )}
-                      </div>
-
-                      {/* Segment */}
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Segment</label>
-                        <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40 uppercase">
-                          {selectedCustomer.segment || '—'}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Workflow Integration fields */}
-                  <div className="space-y-4 pt-4 border-t border-border-color/60">
-                    <h4 className="text-xs font-bold text-text-primary uppercase tracking-wider">Workflow Diagnostics</h4>
-                    
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="space-y-1">
-                        <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider">Last Email Date</span>
-                        <p className="text-xs font-semibold text-text-secondary font-mono">{selectedCustomer.last_email || 'Never'}</p>
-                      </div>
-                      <div className="space-y-1">
-                        <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider">Total Emails Sent</span>
-                        <p className="text-xs font-bold text-text-secondary font-mono">{selectedCustomer.total_emails_sent}</p>
-                      </div>
-                    </div>
-
-                    <div className="space-y-1.5 bg-blue-50/50 border border-blue-200/50 p-3 rounded-xl">
-                      <span className="text-[9px] font-bold text-brand-primary uppercase tracking-wider">Import Reference</span>
-                      <div className="space-y-1">
-                        <p className="text-xs font-bold text-text-primary truncate">
-                          File: {selectedCustomer.import_batch_name || 'Manual Import'}
-                        </p>
-                        <p className="text-[10px] text-text-muted font-medium">
-                          Imported: {selectedCustomer.imported_on}
-                        </p>
-                      </div>
-                    </div>
-
-                    {/* Engagement Timeline Details */}
-                    <div className="space-y-4 pt-4 border-t border-border-color/60">
-                      <h4 className="text-xs font-bold text-text-primary uppercase tracking-wider">Engagement Details</h4>
-                      
-                      <div className="grid grid-cols-2 gap-3 text-xs bg-bg-secondary p-3.5 rounded-xl border border-border-color/50">
-                        <div>
-                          <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Sent This Week</span>
-                          <span className="font-bold text-text-primary">{selectedCustomer.emails_this_week}</span>
-                        </div>
-                        <div>
-                          <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Sent This Month</span>
-                          <span className="font-bold text-text-primary">{selectedCustomer.emails_this_month}</span>
-                        </div>
-                        <div className="col-span-2 pt-2 border-t border-border-color/30">
-                          <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Last Contact Date</span>
-                          <span className="font-semibold text-text-secondary">{selectedCustomer.last_email || 'Never contacted'}</span>
-                        </div>
-                      </div>
-
-                      {selectedCustomer.last_subject && (
-                        <div className="space-y-2 bg-bg-secondary p-3.5 rounded-xl border border-border-color/50 text-xs">
-                          <div>
-                            <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Last Subject</span>
-                            <span className="font-bold text-text-primary block truncate">{selectedCustomer.last_subject}</span>
-                          </div>
-                          <div className="grid grid-cols-2 gap-2 pt-2 border-t border-border-color/30">
-                            <div>
-                              <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Delivery Status</span>
-                              <span className="font-bold text-emerald-650 uppercase">{selectedCustomer.last_delivery_status || 'Delivered'}</span>
-                            </div>
-                            <div>
-                              <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Message ID</span>
-                              <span className="font-semibold text-text-muted truncate block max-w-[120px] font-mono">{selectedCustomer.last_message_id}</span>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Timeline Events list */}
-                      <div className="space-y-2">
-                        <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider block">Engagement Timeline</span>
-                        {selectedCustomer.timeline && selectedCustomer.timeline.length > 0 ? (
-                          <div className="space-y-2 max-h-[160px] overflow-y-auto border border-border-color rounded-xl p-3 bg-bg-secondary/40 font-mono text-[10px]">
-                            {selectedCustomer.timeline.map((evt, idx) => (
-                              <div key={idx} className="flex flex-col border-b border-border-color/30 pb-2 last:border-0 last:pb-0">
-                                <div className="flex justify-between font-bold text-text-muted">
-                                  <span>[{new Date(evt.sent_at).toLocaleDateString()}]</span>
-                                  <span className="text-emerald-650 uppercase">{evt.delivery_status}</span>
-                                </div>
-                                <span className="text-text-primary mt-1 font-sans">{evt.subject}</span>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="text-xs text-text-muted italic text-center py-2 bg-bg-secondary/20 rounded-lg">No engagement history timeline found.</p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <div className="flex flex-col items-center justify-center py-20 text-center space-y-2">
-                  <AlertCircle className="w-8 h-8 text-rose-500" />
-                  <span className="text-xs font-semibold text-text-muted">Error loading customer details.</span>
                 </div>
-              )}
+
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-4 border-t border-border-color/60 text-xs font-semibold text-text-secondary">
+                  <div>
+                    <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Industry</span>
+                    <span className="text-text-primary">{selectedCustomer.industry || '—'}</span>
+                  </div>
+                  <div>
+                    <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Country</span>
+                    <span className="text-text-primary">{selectedCustomer.country || '—'}</span>
+                  </div>
+                  <div>
+                    <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Last Activity</span>
+                    <span className="text-text-primary font-mono">{selectedCustomer.last_email || 'Never contacted'}</span>
+                  </div>
+                  <div>
+                    <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider block">Import Reference</span>
+                    <span className="text-text-primary truncate block max-w-[200px]" title={selectedCustomer.import_batch_name || 'Manual Import'}>
+                      {selectedCustomer.import_batch_name || 'Manual Import'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Workspace Content Tabs */}
+              <div className="space-y-6">
+                {/* Tabs */}
+                <div className="flex border-b border-border-color pb-1 gap-6 text-sm font-bold text-text-muted select-none">
+                  <button 
+                    onClick={() => setActiveTab('overview')}
+                    className={`pb-2 border-b-2 px-1 transition-all cursor-pointer bg-transparent border-0 ${activeTab === 'overview' ? 'border-brand-primary text-brand-primary font-bold' : 'border-transparent hover:text-text-primary'}`}
+                  >
+                    Overview
+                  </button>
+                  <button 
+                    onClick={() => setActiveTab('journey')}
+                    className={`pb-2 border-b-2 px-1 transition-all cursor-pointer bg-transparent border-0 ${activeTab === 'journey' ? 'border-brand-primary text-brand-primary font-bold' : 'border-transparent hover:text-text-primary'}`}
+                  >
+                    AI Journey
+                  </button>
+                </div>
+
+                {/* Tab content view */}
+                {activeTab === 'overview' && (
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    {/* Left details pane (2/3 width) */}
+                    <div className="lg:col-span-2 space-y-6">
+                      <div className="bg-bg-surface p-5 sm:p-6 rounded-xl border border-border-color shadow-sm space-y-4">
+                        <div className="flex justify-between items-center pb-2 border-b border-border-color/60">
+                          <h4 className="text-xs font-bold text-text-primary uppercase tracking-wider">Properties</h4>
+                          {!isEditing ? (
+                            <button
+                              onClick={() => setIsEditing(true)}
+                              className="text-[10px] font-bold text-brand-primary hover:text-brand-primary-hover flex items-center gap-1 cursor-pointer bg-transparent border-0"
+                            >
+                              <Edit2 className="w-3.5 h-3.5" />
+                              <span>Edit</span>
+                            </button>
+                          ) : (
+                            <div className="flex items-center space-x-2">
+                              <button
+                                onClick={handleSaveEdit}
+                                disabled={savingEdit}
+                                className="text-[10px] font-bold text-emerald-600 hover:text-emerald-700 flex items-center gap-1 cursor-pointer bg-transparent border-0"
+                              >
+                                {savingEdit ? '...' : <Check className="w-3.5 h-3.5" />}
+                                <span>Save</span>
+                              </button>
+                              <button
+                                onClick={() => setIsEditing(false)}
+                                className="text-[10px] font-bold text-rose-500 hover:text-rose-600 cursor-pointer bg-transparent border-0"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                          {/* Company Name */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Company</label>
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                value={editForm.company_name}
+                                onChange={(e) => setEditForm(prev => ({ ...prev, company_name: e.target.value }))}
+                                className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold"
+                              />
+                            ) : (
+                              <p className="text-xs font-bold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
+                                {selectedCustomer.company_name}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Contact Name */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Contact Person</label>
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                value={editForm.contact_name}
+                                onChange={(e) => setEditForm(prev => ({ ...prev, contact_name: e.target.value }))}
+                                className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold"
+                              />
+                            ) : (
+                              <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
+                                {selectedCustomer.contact_name || '—'}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Contact Email */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Contact Email</label>
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                value={editForm.contact_email}
+                                onChange={(e) => setEditForm(prev => ({ ...prev, contact_email: e.target.value }))}
+                                className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold font-mono"
+                              />
+                            ) : (
+                              <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40 font-mono">
+                                {selectedCustomer.contact_email || '—'}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Industry */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Industry</label>
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                value={editForm.industry}
+                                onChange={(e) => setEditForm(prev => ({ ...prev, industry: e.target.value }))}
+                                className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold"
+                              />
+                            ) : (
+                              <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
+                                {selectedCustomer.industry || '—'}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Country */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Country</label>
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                value={editForm.country}
+                                onChange={(e) => setEditForm(prev => ({ ...prev, country: e.target.value }))}
+                                className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold"
+                              />
+                            ) : (
+                              <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
+                                {selectedCustomer.country || '—'}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Segment */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Segment</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40 uppercase">
+                              {selectedCustomer.segment || '—'}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Right widgets (1/3 width) */}
+                    <div className="space-y-6">
+                      <div className="bg-bg-surface p-5 rounded-xl border border-border-color shadow-sm space-y-4">
+                        <h4 className="text-xs font-bold text-text-primary uppercase tracking-wider border-b border-border-color pb-2">Workflow diagnostics</h4>
+                        <div className="grid grid-cols-2 gap-4 text-xs">
+                          <div>
+                            <span className="text-[9px] font-bold text-text-muted uppercase block">Last Contact</span>
+                            <span className="font-semibold text-text-primary font-mono">{selectedCustomer.last_email || 'Never'}</span>
+                          </div>
+                          <div>
+                            <span className="text-[9px] font-bold text-text-muted uppercase block">Total Emails</span>
+                            <span className="font-bold text-brand-primary font-mono">{selectedCustomer.total_emails_sent}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {activeTab === 'journey' && (
+                  <div className="max-w-5xl bg-bg-surface p-6 sm:p-8 rounded-xl border border-border-color shadow-sm">
+                    {loadingJourney ? (
+                      <div className="space-y-4">
+                        {[1, 2, 3].map((n) => (
+                          <div key={n} className="animate-pulse flex space-x-3 items-start py-2">
+                            <div className="rounded-full bg-slate-200 h-8 w-8" />
+                            <div className="flex-1 space-y-2 py-1">
+                              <div className="h-2.5 bg-slate-200 rounded w-1/4" />
+                              <div className="h-2 bg-slate-200 rounded w-3/4" />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : journeyTimeline.length === 0 ? (
+                      <div className="text-center py-10 bg-bg-secondary/20 border border-border-color rounded-xl">
+                        <p className="text-xs text-text-muted italic">Customer imported. No engagement started yet.</p>
+                      </div>
+                    ) : (
+                      <div className="relative border-l border-border-color/80 ml-3.5 pl-6 space-y-6">
+                        {journeyTimeline.map((evt, idx) => {
+                          const isExpanded = expandedEvents[evt.id] || false;
+                          
+                          // Determine wait days
+                          const nextEvt = journeyTimeline[idx + 1];
+                          let waitDays = 0;
+                          if (nextEvt) {
+                            const diffTime = Math.abs(new Date(nextEvt.timestamp).getTime() - new Date(evt.timestamp).getTime());
+                            waitDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                          }
+
+                          return (
+                            <div key={evt.id} className="relative">
+                              {/* Bullet node */}
+                              <span className={`absolute -left-[30px] top-1.5 flex items-center justify-center w-6 h-6 rounded-full border shadow-xs ${getEventColorClasses(evt.color || 'slate')}`}>
+                                {getEventIcon(evt.event_type)}
+                              </span>
+
+                              {/* Card */}
+                              <div 
+                                onClick={() => evt.expandable && setExpandedEvents(prev => ({ ...prev, [evt.id]: !isExpanded }))}
+                                className={`rounded-xl p-5 space-y-3 shadow-2xs border transition-all ${
+                                  evt.expandable ? 'cursor-pointer hover:border-border-color/80' : ''
+                                } ${
+                                  evt.event_type === 'reply_received' 
+                                    ? 'bg-emerald-500/5 border-emerald-500/30 ring-1 ring-emerald-500/20' 
+                                    : 'bg-bg-surface border-border-color'
+                                }`}
+                              >
+                                <div className="flex items-start justify-between gap-4">
+                                  <div className="space-y-1">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <span className="text-[9px] font-bold text-text-muted uppercase tracking-wider bg-bg-secondary px-2 py-0.5 rounded border border-border-color">
+                                        {evt.module}
+                                      </span>
+                                      <span className="text-sm font-bold text-text-primary">
+                                        {evt.title}
+                                      </span>
+                                    </div>
+                                    {evt.subtitle && (
+                                      <p className="text-2xs text-text-secondary font-semibold max-w-lg">
+                                        {evt.subtitle}
+                                      </p>
+                                    )}
+                                  </div>
+                                  <span className="text-[10px] font-bold text-text-muted font-mono shrink-0">
+                                    {new Date(evt.timestamp).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })}
+                                  </span>
+                                </div>
+
+                                <p className="text-xs text-text-secondary leading-relaxed font-medium">
+                                  {evt.description}
+                                </p>
+
+                                {evt.expandable && (
+                                  <>
+                                    <button
+                                      onClick={(e) => { e.stopPropagation(); setExpandedEvents(prev => ({ ...prev, [evt.id]: !isExpanded })) }}
+                                      className="text-[10px] font-bold text-brand-primary hover:text-brand-primary-hover flex items-center gap-1 bg-transparent border-0 cursor-pointer p-0"
+                                    >
+                                      <span>{isExpanded ? 'Collapse Details' : 'Inspect Details'}</span>
+                                      {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                                    </button>
+
+                                    {isExpanded && evt.mail && (
+                                      <div 
+                                        onClick={(e) => e.stopPropagation()}
+                                        className="mt-3 p-4 bg-bg-secondary/40 border border-border-color rounded-xl space-y-3 text-[11px] select-text cursor-default"
+                                      >
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-2xs border-b border-border-color/40 pb-2 mb-2">
+                                          <div><span className="text-text-muted">Sender Name:</span> <strong className="text-text-primary">{evt.mail.sender}</strong></div>
+                                          <div><span className="text-text-muted">Recipient:</span> <strong className="text-text-primary">{evt.mail.recipient}</strong></div>
+                                          <div><span className="text-text-muted">Subject:</span> <strong className="text-text-primary">{evt.mail.subject}</strong></div>
+                                          <div><span className="text-text-muted">Communication Type:</span> <strong className="text-text-primary">{evt.mail.email_type || evt.event_type}</strong></div>
+                                          {evt.step_number && <div><span className="text-text-muted">Sequence Step:</span> <strong className="text-text-primary">Step {evt.step_number}</strong></div>}
+                                          <div><span className="text-text-muted">Sent Time:</span> <strong className="text-text-primary">{new Date(evt.timestamp).toLocaleString()}</strong></div>
+                                          <div><span className="text-text-muted">Email Status:</span> <strong className="text-text-primary uppercase">{evt.mail.delivery_status || 'completed'}</strong></div>
+                                        </div>
+                                        <div className="whitespace-pre-wrap text-text-secondary leading-relaxed font-sans max-h-[300px] overflow-y-auto pr-1 text-2xs">
+                                          {stripHtmlToPlainText(evt.mail.body)}
+                                        </div>
+                                        
+                                        {evt.attachments && evt.attachments.length > 0 && (
+                                          <div className="pt-2 border-t border-border-color/30 flex items-center gap-1.5 flex-wrap">
+                                            {evt.attachments.map((attName, aIdx) => (
+                                              <div 
+                                                key={aIdx} 
+                                                onClick={(e) => e.stopPropagation()}
+                                                className="flex items-center space-x-1.5 text-text-muted bg-white border border-border-color px-2.5 py-1 rounded-lg shadow-2xs cursor-default"
+                                              >
+                                                <FileText className="w-3.5 h-3.5 text-slate-400" />
+                                                <span className="font-semibold">{attName}</span>
+                                              </div>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </>
+                                )}
+                              </div>
+
+                              {/* WAIT Connector Line */}
+                              {waitDays > 0 && (
+                                <div className="py-3 my-2 text-center select-none relative">
+                                  <div className="absolute inset-0 flex items-center" aria-hidden="true">
+                                    <div className="w-full border-t border-dashed border-border-color/85" />
+                                  </div>
+                                  <span className="relative inline-flex items-center px-4 py-1.5 bg-white border border-border-color rounded-full text-[9px] font-bold text-brand-primary tracking-widest uppercase shadow-2xs">
+                                    WAIT {waitDays} {waitDays === 1 ? 'DAY' : 'DAYS'}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="flex flex-col items-center justify-center py-20 text-center space-y-2">
+              <AlertCircle className="w-8 h-8 text-rose-500" />
+              <span className="text-xs font-semibold text-text-muted">Error loading customer details.</span>
             </div>
-          </div>
+          )}
         </div>
       )}
 

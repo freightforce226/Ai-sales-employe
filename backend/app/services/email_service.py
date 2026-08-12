@@ -179,10 +179,12 @@ class EmailService:
         import traceback
         import uuid
         import sys
+        import time
         from app.core.logging import request_id_var
         from app.core.debug_logger import log_to_request_file
         from app.services.email_branding_service import EmailBrandingService
         
+        overall_start_time = time.perf_counter()
         req_id = request_id_var.get() or "UNKNOWN"
         prefix = f"[REQ-{req_id}] "
 
@@ -224,10 +226,9 @@ class EmailService:
 
         # Diagnostic Helper
         def handle_diagnostic_failure(stage: str, exc: Exception, local_vars: dict):
-            tb = traceback.format_exc()
-            exc_class = type(exc).__name__
+            duration = f"{time.perf_counter() - overall_start_time:.2f}"
+            req = local_vars.get("request")
             
-            # Find failing file and line number
             tb_frames = traceback.extract_tb(exc.__traceback__)
             failing_file = "Unknown"
             failing_line = "Unknown"
@@ -236,25 +237,76 @@ class EmailService:
                 failing_file = last_frame.filename
                 failing_line = last_frame.lineno
 
+            org_name = "Amplus Logistics"
+            cust_name = "Unknown"
+            rec_email = recipient
+            seq_step = "Unknown"
+            camp_name = "Follow-up Campaign"
+            sub_val = subject
+            att_count = 0
+            att_names = []
+            
+            if req:
+                rec_email = req.customer_email or recipient
+                sub_val = req.subject or subject
+                att_count = len(req.attachments) if req.attachments else 0
+                att_names = [a.filename for a in req.attachments] if req.attachments else []
+                if getattr(req, "step_number", None):
+                    seq_step = f"Step {req.step_number}"
+                
+            if local_vars.get("contact_name"):
+                cust_name = local_vars.get("contact_name")
+            elif local_vars.get("customer_row"):
+                row = local_vars.get("customer_row")
+                try:
+                    cust_name = row[1] or row[2] or "Unknown"
+                except Exception:
+                    pass
+
+            if local_vars.get("sender_display_name"):
+                org_name = local_vars.get("sender_display_name")
+
+            provider_val = "Microsoft Graph"
+            if local_vars.get("smtp_send_completed") is not None or "smtp" in stage.lower():
+                provider_val = "SMTP Provider"
+
+            error_msg = f"{type(exc).__name__}: {str(exc)}"
+
             diag_msg = (
-                f"===== RUNTIME EXCEPTION IN {stage.upper()} =====\n"
-                f"1. Recipient Email: {recipient}\n"
-                f"2. Full Python Traceback:\n{tb}\n"
-                f"3. Exception Class: {exc_class}\n"
-                f"4. Failing File: {failing_file}\n"
-                f"5. Failing Line Number: {failing_line}\n"
-                f"6. Local Variables: {repr(local_vars)}\n"
-                f"7. SMTP send completed: {smtp_send_completed}\n"
-                f"8. email_log insert completed: {email_log_insert_completed}\n"
-                f"9. attachment insert completed: {attachment_insert_completed}\n"
-                f"10. follow-up scheduling completed: {followup_scheduling_completed}\n"
-                f"11. embedding generation started: {embedding_generation_started}\n"
-                f"12. campaign enrollment update completed: {campaign_enrollment_update_completed}\n"
-                f"================================================="
+                "\n-------------------------------------------------\n"
+                "EMAIL SEND FAILED\n"
+                f"Organization     {org_name}\n"
+                f"Customer         {cust_name}\n"
+                f"Recipient        {rec_email}\n"
+                f"Sequence         {seq_step}\n"
+                f"Campaign         {camp_name}\n"
+                f"Subject          {sub_val}\n"
+                f"Attachments      {att_count}\n"
+                f"Attachment Names {att_names}\n"
+                f"Attempt          1\n"
+                f"Duration         {duration} seconds\n"
+                f"Provider         {provider_val}\n"
+                f"Error            {error_msg}\n"
+                "-------------------------------------------------"
             )
             print(diag_msg, file=sys.stderr, flush=True)
             log_to_request_file(diag_msg)
-            logger.error("Email send path failure diagnostic", stage=stage, exc_class=exc_class, failing_line=failing_line)
+            logger.error("Email send path failure diagnostic", 
+                         stage=stage, 
+                         exc_class=type(exc).__name__, 
+                         failing_file=failing_file,
+                         failing_line=failing_line,
+                         organization=org_name,
+                         customer=cust_name,
+                         recipient=rec_email,
+                         sequence=seq_step,
+                         campaign=camp_name,
+                         subject=sub_val,
+                         attachment_count=att_count,
+                         attachment_names=att_names,
+                         duration=f"{duration}s",
+                         provider=provider_val,
+                         error=error_msg)
 
         # STEP 1: Request received
         async with StepTracker(1, "Request received"):
@@ -698,6 +750,46 @@ class EmailService:
             async with StepTracker(7, "Save Email History"):
                 email_log_id = uuid.uuid4()
                 has_attachment = len(request.attachments) > 0 if request.attachments else False
+
+                # Resolve campaign_id and email_type dynamically from current scheduler state
+                email_type_val = "engagement"
+                campaign_id_val = None
+                if customer_id:
+                    # 1. Check if there is an active/pending follow-up schedule item for this customer
+                    step_res = await self.session.execute(
+                        text("""
+                            SELECT campaign_id 
+                            FROM follow_up_schedule 
+                            WHERE customer_id = :cust_id 
+                              AND organization_id = :org_id 
+                              AND status::text IN ('pending', 'scheduled', 'paused')
+                            ORDER BY step_number ASC 
+                            LIMIT 1
+                        """),
+                        {"cust_id": customer_id, "org_id": request.organization_id}
+                    )
+                    step_row = step_res.fetchone()
+                    if step_row:
+                        email_type_val = "followup"
+                        campaign_id_val = step_row[0]
+                    
+                    # 2. Fallback to active campaign enrollment
+                    if not campaign_id_val:
+                        enroll_res = await self.session.execute(
+                            text("""
+                                SELECT campaign_id 
+                                FROM campaign_enrollments 
+                                WHERE customer_id = :cust_id 
+                                  AND organization_id = :org_id 
+                                  AND enrollment_status = 'active'
+                                LIMIT 1
+                            """),
+                            {"cust_id": customer_id, "org_id": request.organization_id}
+                        )
+                        enroll_row = enroll_res.fetchone()
+                        if enroll_row:
+                            campaign_id_val = enroll_row[0]
+
                 await self.session.execute(
                     text("""
                         INSERT INTO email_log (
@@ -705,8 +797,8 @@ class EmailService:
                             email_type, subject, body, has_attachment, sent_at, delivery_status, graph_message_id,
                             conversation_id, thread_id, internet_message_id, "references", in_reply_to, created_at
                         ) VALUES (
-                            :id, :org_id, :customer_id, NULL, 'outbound', 
-                            'engagement', :subject, :body, :has_attachment, NOW(), 'sent', :graph_message_id,
+                            :id, :org_id, :customer_id, :campaign_id, 'outbound', 
+                            CAST(:email_type AS public.email_type), :subject, :body, :has_attachment, NOW(), 'sent', :graph_message_id,
                             :conversation_id, :thread_id, :internet_message_id, :references, :in_reply_to, NOW()
                         )
                     """),
@@ -714,6 +806,8 @@ class EmailService:
                         "id": email_log_id,
                         "org_id": request.organization_id,
                         "customer_id": customer_id,
+                        "campaign_id": campaign_id_val,
+                        "email_type": email_type_val,
                         "subject": request.subject,
                         "body": final_html_body,
                         "has_attachment": has_attachment,

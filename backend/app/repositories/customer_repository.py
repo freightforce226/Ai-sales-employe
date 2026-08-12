@@ -46,8 +46,10 @@ class CustomerRepository:
         # Data Query
         select_fields = """
             SELECT c.id, c.company_name, c.contact_name, c.contact_email, c.industry, c.country, 
-                   (SELECT cs2.segment_type FROM customer_segments cs2 WHERE cs2.customer_id = c.id LIMIT 1) as segment_type,
-                   c.last_contact_date, c.created_at
+                   (SELECT cs2.segment_type FROM customer_segments cs2 WHERE cs2.customer_id = c.id ORDER BY cs2.computed_at DESC LIMIT 1) as segment_type,
+                   c.last_contact_date, c.created_at,
+                   (SELECT CAST(ce.enrollment_status AS VARCHAR) FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as enrollment_status,
+                   (SELECT ce.exit_reason FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as exit_reason
         """
         data_query = text(f"{select_fields} {query_str} ORDER BY c.created_at DESC LIMIT :limit OFFSET :offset")
         params["limit"] = limit
@@ -62,10 +64,12 @@ class CustomerRepository:
         res = await self.db.execute(
             text("""
                 SELECT c.id, c.company_name, c.contact_name, c.contact_email, c.industry, c.country, 
-                       cs.segment_type, c.last_contact_date, c.created_at, c.import_batch_id,
-                       ib.file_name, ib.created_at
+                       (SELECT cs2.segment_type FROM customer_segments cs2 WHERE cs2.customer_id = c.id ORDER BY cs2.computed_at DESC LIMIT 1) as segment_type,
+                       c.last_contact_date, c.created_at, c.import_batch_id,
+                       ib.file_name, ib.created_at,
+                       (SELECT CAST(ce.enrollment_status AS VARCHAR) FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as enrollment_status,
+                       (SELECT ce.exit_reason FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as exit_reason
                 FROM customers c
-                LEFT JOIN customer_segments cs ON c.id = cs.customer_id AND cs.organization_id = :org_id
                 LEFT JOIN import_batches ib ON c.import_batch_id = ib.id AND ib.organization_id = :org_id
                 WHERE c.id = :id AND c.organization_id = :org_id AND c.deleted_at IS NULL
             """),
@@ -136,11 +140,17 @@ class CustomerRepository:
         # Segments breakdown
         seg_res = await self.db.execute(
             text("""
-                SELECT cs.segment_type, COUNT(*) 
+                SELECT latest_seg.segment_type, COUNT(*) 
                 FROM customers c
-                JOIN customer_segments cs ON c.id = cs.customer_id
+                INNER JOIN LATERAL (
+                    SELECT cs.segment_type
+                    FROM customer_segments cs
+                    WHERE cs.customer_id = c.id
+                    ORDER BY cs.computed_at DESC
+                    LIMIT 1
+                ) latest_seg ON TRUE
                 WHERE c.organization_id = :org_id AND c.deleted_at IS NULL
-                GROUP BY cs.segment_type
+                GROUP BY latest_seg.segment_type
             """),
             {"org_id": self.org_id}
         )

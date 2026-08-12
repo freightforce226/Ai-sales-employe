@@ -20,6 +20,8 @@ async def run_scheduled_migrations():
             await session.execute(text("DROP FUNCTION IF EXISTS public.get_engagement_eligible_customers(uuid, date, integer, integer, integer, integer);"))
             await session.execute(text("DROP FUNCTION IF EXISTS public.enqueue_followup_step(uuid, uuid, uuid);"))
             await session.execute(text("DROP FUNCTION IF EXISTS public.enqueue_followup_step(uuid, uuid, uuid, integer);"))
+            await session.execute(text("DROP FUNCTION IF EXISTS public.start_engagement_execution(uuid, text, text, uuid, integer);"))
+            await session.execute(text("DROP FUNCTION IF EXISTS public.start_followup_execution(uuid, text, text, uuid, integer);"))
 
             # Alter follow_up_schedule table to add completed_at, message_id, and reply tracking details
             await session.execute(text("ALTER TABLE public.follow_up_schedule ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP WITH TIME ZONE;"))
@@ -236,13 +238,12 @@ async def run_scheduled_migrations():
                     v_profile_id := (v_step_config->>'attachment_profile_id')::uuid;
                   END IF;
 
-                  -- 3. Idempotency Check: check for an existing active schedule (status pending or paused)
+                  -- 3. Idempotency Check: check for any existing schedule for this step number
                   SELECT id INTO v_followup_id
                   FROM follow_up_schedule
                   WHERE organization_id = p_organization_id
                     AND customer_id = p_customer_id
-                    AND step_number = p_step_number
-                    AND status::text IN ('pending', 'paused');
+                    AND step_number = p_step_number;
 
                   IF v_followup_id IS NOT NULL THEN
                     RETURN v_followup_id;
@@ -465,7 +466,7 @@ async def run_scheduled_migrations():
                     p_workflow_execution_id TEXT,
                     p_trigger_type TEXT,
                     p_started_by_user UUID,
-                    p_timeout_hours INTEGER DEFAULT 2
+                    p_timeout_minutes INTEGER DEFAULT 30
                 )
                 RETURNS TABLE (
                     already_running BOOLEAN,
@@ -495,11 +496,11 @@ async def run_scheduled_migrations():
                     -- Clean up stale executions
                     UPDATE public.engagement_executions
                     SET status = 'failed',
-                        error_message = 'Execution timed out after ' || p_timeout_hours || ' hours in started/running/pending state.',
+                        error_message = 'Execution timed out after ' || p_timeout_minutes || ' minutes in started/running/pending state.',
                         completed_at = NOW()
                     WHERE organization_id = p_organization_id
                        AND status IN ('pending', 'started', 'running')
-                       AND started_at < (NOW() - (p_timeout_hours || ' hours')::INTERVAL);
+                       AND started_at < (NOW() - (p_timeout_minutes * INTERVAL '1 minute'));
 
                     -- Check for active execution
                     SELECT id, public.engagement_executions.workflow_execution_id, status, public.engagement_executions.started_at, total_customers
@@ -562,7 +563,7 @@ async def run_scheduled_migrations():
                     p_workflow_execution_id TEXT,
                     p_trigger_type TEXT,
                     p_started_by_user UUID,
-                    p_timeout_hours INTEGER DEFAULT 2
+                    p_timeout_minutes INTEGER DEFAULT 30
                 )
                 RETURNS TABLE (
                     already_running BOOLEAN,
@@ -589,11 +590,11 @@ async def run_scheduled_migrations():
                     -- Clean up stale executions
                     UPDATE public.follow_up_executions
                     SET status = 'failed',
-                        error_message = 'Execution timed out after ' || p_timeout_hours || ' hours in started/running/pending state.',
+                        error_message = 'Execution timed out after ' || p_timeout_minutes || ' minutes in started/running/pending state.',
                         completed_at = NOW()
                     WHERE organization_id = p_organization_id
                       AND status IN ('pending', 'started', 'running')
-                      AND started_at < (NOW() - (p_timeout_hours || ' hours')::INTERVAL);
+                      AND started_at < (NOW() - (p_timeout_minutes * INTERVAL '1 minute'));
 
                     -- Check for active execution
                     SELECT id, public.follow_up_executions.workflow_execution_id, status, public.follow_up_executions.started_at, total_customers
@@ -636,6 +637,56 @@ async def run_scheduled_migrations():
             """))
             logger.info("Successfully deployed start execution stored procedures.")
 
+            # Deploy customer segment auto-refresh trigger DDL
+            await session.execute(text("""
+                CREATE OR REPLACE FUNCTION public.refresh_customer_segment_trigger()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM customer_segments 
+                    WHERE customer_id = NEW.id AND computed_at::date = CURRENT_DATE
+                  ) THEN
+                    UPDATE customer_segments
+                    SET segment_type = (CASE
+                          WHEN NEW.last_contact_date IS NULL THEN 'dormant'
+                          WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '90 days') THEN 'dormant'
+                          WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '31 days') THEN 'inactive'
+                          ELSE 'active'
+                        END)::segment_type,
+                        computed_by = 'trigger_contact_date_update',
+                        computed_at = NOW()
+                    WHERE customer_id = NEW.id AND computed_at::date = CURRENT_DATE;
+                  ELSE
+                    INSERT INTO customer_segments (id, organization_id, customer_id, segment_type, computed_by, computed_at)
+                    VALUES (
+                      gen_random_uuid(),
+                      NEW.organization_id,
+                      NEW.id,
+                      (CASE
+                        WHEN NEW.last_contact_date IS NULL THEN 'dormant'
+                        WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '90 days') THEN 'dormant'
+                        WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '31 days') THEN 'inactive'
+                        ELSE 'active'
+                      END)::segment_type,
+                      'trigger_contact_date_update',
+                      NOW()
+                    );
+                  END IF;
+                  RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+            """))
+            await session.execute(text("""
+                DROP TRIGGER IF EXISTS trg_refresh_segment_on_contact ON public.customers;
+            """))
+            await session.execute(text("""
+                CREATE TRIGGER trg_refresh_segment_on_contact
+                AFTER UPDATE OF last_contact_date ON public.customers
+                FOR EACH ROW
+                EXECUTE FUNCTION public.refresh_customer_segment_trigger();
+            """))
+            logger.info("Successfully deployed customer segment refresh trigger.")
+
             await session.commit()
             
         except Exception as e:
@@ -643,30 +694,159 @@ async def run_scheduled_migrations():
             logger.error("DDL Migration failed", error=str(e))
             raise e
 
-    # Backfill historical engagement email logs
+    # Safe Idempotent Backfill & State Repair
     async with AsyncSessionLocal() as session:
         try:
-            logger.info("Starting historical engagement emails backfill...")
-            res = await session.execute(text("""
-                SELECT id, organization_id, customer_id, sent_at 
-                FROM email_log 
-                WHERE email_type = 'engagement' AND direction = 'outbound'
+            logger.info("Starting production database state audit and backfill...")
+            
+            # --- 1. AUDIT BEFORE ---
+            missing_ce_before = (await session.execute(text("""
+                SELECT count(DISTINCT c.id) FROM customers c
+                LEFT JOIN campaign_enrollments ce ON c.id = ce.customer_id
+                WHERE ce.id IS NULL AND c.deleted_at IS NULL
+                  AND (EXISTS (SELECT 1 FROM follow_up_schedule f WHERE f.customer_id = c.id)
+                       OR EXISTS (SELECT 1 FROM email_log e WHERE e.customer_id = c.id AND e.direction = 'outbound'))
+            """))).scalar() or 0
+
+            missing_lcd_before = (await session.execute(text("""
+                SELECT count(*) FROM customers c
+                WHERE c.last_contact_date IS NULL AND c.deleted_at IS NULL
+                  AND EXISTS (SELECT 1 FROM email_log e WHERE e.customer_id = c.id)
+            """))).scalar() or 0
+
+            missing_ra_before = (await session.execute(text("""
+                SELECT count(*) FROM email_log e1
+                WHERE e1.direction = 'outbound' AND e1.replied_at IS NULL
+                  AND EXISTS (SELECT 1 FROM email_log e2 WHERE e2.customer_id = e1.customer_id AND e2.direction = 'inbound' AND e2.created_at > e1.created_at)
+            """))).scalar() or 0
+
+            logger.info(f"AUDIT BEFORE - Missing Enrollments: {missing_ce_before}, Missing Contact Dates: {missing_lcd_before}, Missing replied_at: {missing_ra_before}")
+
+            # --- 2. EXECUTE REPAIRS (TRANSACTIONAL) ---
+            # Pre-repair: Ensure a default campaign exists for any organization that has customers
+            await session.execute(text("""
+                INSERT INTO campaigns (id, organization_id, name, status, created_at, updated_at)
+                SELECT 
+                    gen_random_uuid() as id,
+                    orgs.organization_id,
+                    'Default Campaign' as name,
+                    'draft'::public.campaign_status as status,
+                    NOW() as created_at,
+                    NOW() as updated_at
+                FROM (
+                    SELECT DISTINCT c.organization_id 
+                    FROM customers c
+                    WHERE c.deleted_at IS NULL
+                      AND NOT EXISTS (SELECT 1 FROM campaigns WHERE organization_id = c.organization_id)
+                ) orgs;
             """))
-            logs = res.fetchall()
-            backfilled_count = 0
-            for email_log_id, org_id, cust_id, sent_at in logs:
-                enqueue_res = await session.execute(
-                    text("SELECT public.enqueue_followup_step(:org_id, :cust_id, :log_id)"),
-                    {"org_id": org_id, "cust_id": cust_id, "log_id": email_log_id}
+
+            # A. Backfill missing campaign enrollments safely
+            await session.execute(text("""
+                INSERT INTO campaign_enrollments (id, organization_id, campaign_id, customer_id, enrollment_status, enrolled_at, created_at, updated_at)
+                SELECT 
+                    gen_random_uuid() as id,
+                    c.organization_id,
+                    (SELECT id FROM campaigns WHERE organization_id = c.organization_id LIMIT 1) as campaign_id,
+                    c.id as customer_id,
+                    'completed'::public.enrollment_status as enrollment_status,
+                    c.created_at as enrolled_at,
+                    NOW() as created_at,
+                    NOW() as updated_at
+                FROM customers c
+                WHERE c.deleted_at IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM campaign_enrollments ce WHERE ce.customer_id = c.id)
+                  AND (
+                    EXISTS (SELECT 1 FROM follow_up_schedule f WHERE f.customer_id = c.id)
+                    OR EXISTS (SELECT 1 FROM email_log e WHERE e.customer_id = c.id AND e.direction = 'outbound')
+                  );
+            """))
+
+            # B. Backfill missing contact dates from actual email log timestamps
+            await session.execute(text("""
+                UPDATE customers c
+                SET last_contact_date = sub.latest_contact::date,
+                    updated_at = NOW()
+                FROM (
+                    SELECT customer_id, MAX(COALESCE(sent_at, received_at, created_at)) as latest_contact
+                    FROM email_log
+                    GROUP BY customer_id
+                ) sub
+                WHERE c.id = sub.customer_id
+                  AND c.deleted_at IS NULL
+                  AND (c.last_contact_date IS NULL OR c.last_contact_date < sub.latest_contact::date);
+            """))
+
+            # C. Backfill missing replied_at timestamps on original outbound logs
+            await session.execute(text("""
+                UPDATE email_log e1
+                SET replied_at = sub.reply_time
+                FROM (
+                    SELECT e2.customer_id, MIN(e2.received_at) as reply_time, MIN(e2.created_at) as reply_created
+                    FROM email_log e2
+                    WHERE e2.direction = 'inbound'
+                    GROUP BY e2.customer_id
+                ) sub
+                WHERE e1.customer_id = sub.customer_id
+                  AND e1.direction = 'outbound'
+                  AND e1.replied_at IS NULL
+                  AND e1.created_at < sub.reply_created;
+            """))
+
+            # --- Phase 1: Duplicate Step 1 Cleanup ---
+            dup_res = await session.execute(text("""
+                SELECT f1.id 
+                FROM follow_up_schedule f1
+                WHERE CAST(f1.status AS VARCHAR) = 'pending'
+                  AND EXISTS (
+                    SELECT 1 
+                    FROM follow_up_schedule f2
+                    WHERE f2.customer_id = f1.customer_id
+                      AND (f2.campaign_id = f1.campaign_id OR (f2.campaign_id IS NULL AND f1.campaign_id IS NULL))
+                      AND f2.step_number = f1.step_number
+                      AND CAST(f2.status AS VARCHAR) = 'completed'
+                  );
+            """))
+            dup_ids = [str(r[0]) for r in dup_res.fetchall()]
+            
+            if dup_ids:
+                logger.info(f"Phase 1: Found {len(dup_ids)} duplicate pending Step 1 schedules: {dup_ids}")
+                await session.execute(
+                    text("DELETE FROM follow_up_schedule WHERE id = ANY(CAST(:ids AS uuid[]))"),
+                    {"ids": dup_ids}
                 )
-                new_fid = enqueue_res.scalar()
-                if new_fid:
-                    backfilled_count += 1
+                logger.info(f"Phase 1: Successfully deleted {len(dup_ids)} duplicate pending Step 1 records.")
+            else:
+                logger.info("Phase 1: No duplicate pending Step 1 schedules found.")
+
             await session.commit()
-            logger.info(f"Backfill successfully completed. Scheduled {backfilled_count} new follow-up records.")
+
+            # --- 3. AUDIT AFTER ---
+            missing_ce_after = (await session.execute(text("""
+                SELECT count(DISTINCT c.id) FROM customers c
+                LEFT JOIN campaign_enrollments ce ON c.id = ce.customer_id
+                WHERE ce.id IS NULL AND c.deleted_at IS NULL
+                  AND (EXISTS (SELECT 1 FROM follow_up_schedule f WHERE f.customer_id = c.id)
+                       OR EXISTS (SELECT 1 FROM email_log e WHERE e.customer_id = c.id AND e.direction = 'outbound'))
+            """))).scalar() or 0
+
+            missing_lcd_after = (await session.execute(text("""
+                SELECT count(*) FROM customers c
+                WHERE c.last_contact_date IS NULL AND c.deleted_at IS NULL
+                  AND EXISTS (SELECT 1 FROM email_log e WHERE e.customer_id = c.id)
+            """))).scalar() or 0
+
+            missing_ra_after = (await session.execute(text("""
+                SELECT count(*) FROM email_log e1
+                WHERE e1.direction = 'outbound' AND e1.replied_at IS NULL
+                  AND EXISTS (SELECT 1 FROM email_log e2 WHERE e2.customer_id = e1.customer_id AND e2.direction = 'inbound' AND e2.created_at > e1.created_at)
+            """))).scalar() or 0
+
+            logger.info(f"AUDIT AFTER - Missing Enrollments: {missing_ce_after}, Missing Contact Dates: {missing_lcd_after}, Missing replied_at: {missing_ra_after}")
+            logger.info("Production database state repair successfully finished.")
         except Exception as e:
             await session.rollback()
-            logger.error("Backfill failed", error=str(e))
+            logger.error("State repair backfill transaction failed", error=str(e))
 
 if __name__ == "__main__":
     asyncio.run(run_scheduled_migrations())

@@ -4,6 +4,8 @@ from app.db.session import get_db_session
 from app.core.auth import get_current_user
 from app.models.user import User
 from app.services.customer_service import CustomerService
+from app.services.customer_journey_service import CustomerJourneyService
+from app.schemas.journey import CustomerJourneyResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from uuid import UUID
@@ -165,3 +167,13 @@ async def bulk_delete_customers(
     deleted_count = await service.bulk_delete_customers(request.ids)
     await db.commit()
     return {"success": True, "deleted_count": deleted_count}
+
+
+@router.get("/{id}/journey", response_model=CustomerJourneyResponse)
+async def get_customer_journey(
+    id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session)
+):
+    service = CustomerJourneyService(db, current_user.organization_id)
+    return await service.get_journey(id)

@@ -24,7 +24,27 @@ async def get_dashboard_metrics(
         )
         total_contacts = contacts_res.scalar() or 0
 
-        # 2. Total campaigns
+        # 2. Customers under automation (active campaign enrollments OR pending follow-up schedule)
+        automation_res = await db.execute(
+            text("""
+                SELECT COUNT(DISTINCT customer_id) 
+                FROM (
+                    SELECT customer_id 
+                    FROM campaign_enrollments 
+                    WHERE organization_id = :org_id 
+                      AND CAST(enrollment_status AS VARCHAR) = 'active'
+                    UNION
+                    SELECT customer_id 
+                    FROM follow_up_schedule 
+                    WHERE organization_id = :org_id 
+                      AND CAST(status AS VARCHAR) IN ('pending', 'paused', 'scheduled')
+                ) sub
+            """),
+            {"org_id": org_id}
+        )
+        customers_under_automation = automation_res.scalar() or 0
+
+        # For backward compatibility, also fetch total_campaigns count
         campaigns_res = await db.execute(
             text("SELECT count(*) FROM campaigns WHERE organization_id = :org_id AND deleted_at IS NULL"),
             {"org_id": org_id}
@@ -40,11 +60,35 @@ async def get_dashboard_metrics(
 
         # 4. Response rate
         replies_res = await db.execute(
-            text("SELECT count(*) FROM email_log WHERE organization_id = :org_id AND replied_at IS NOT NULL"),
+            text("""
+                SELECT COUNT(DISTINCT el.customer_id) 
+                FROM email_log el
+                JOIN customers c ON el.customer_id = c.id
+                WHERE el.organization_id = :org_id 
+                  AND el.direction = 'inbound'
+                  AND c.contact_email NOT LIKE '%@freightforce.ai'
+                  AND c.contact_email NOT LIKE 'golupandit82094%'
+            """),
             {"org_id": org_id}
         )
         total_replies = replies_res.scalar() or 0
         response_rate = round((total_replies / total_emails * 100), 1) if total_emails > 0 else 0.0
+
+        # Replies today (in the last 24 hours)
+        replies_today_res = await db.execute(
+            text("""
+                SELECT COUNT(DISTINCT el.customer_id) 
+                FROM email_log el
+                JOIN customers c ON el.customer_id = c.id
+                WHERE el.organization_id = :org_id 
+                  AND el.direction = 'inbound' 
+                  AND el.received_at >= NOW() - INTERVAL '24 hours'
+                  AND c.contact_email NOT LIKE '%@freightforce.ai'
+                  AND c.contact_email NOT LIKE 'golupandit82094%'
+            """),
+            {"org_id": org_id}
+        )
+        replies_today = replies_today_res.scalar() or 0
 
         # 5. Recent leads/customers
         leads_res = await db.execute(
@@ -68,36 +112,70 @@ async def get_dashboard_metrics(
                 "created_at": str(row[5]) if row[5] else None
             })
 
-        # 6. Recent activity from email log
-        activity_res = await db.execute(
+        # 6. Fetch sender display name dynamically
+        sender_res = await db.execute(
             text("""
-                SELECT e.subject, e.sent_at, e.received_at, c.contact_name, c.company_name
-                FROM email_log e
-                LEFT JOIN customers c ON e.customer_id = c.id
-                WHERE e.organization_id = :org_id
-                ORDER BY e.created_at DESC
-                LIMIT 5
+                SELECT u.full_name, o.display_name 
+                FROM organizations o
+                LEFT JOIN tenant_integrations ti ON o.id = ti.organization_id
+                LEFT JOIN users u ON ti.mailbox_email = u.email
+                WHERE o.id = :org_id
+                LIMIT 1
             """),
             {"org_id": org_id}
         )
+        sender_row = sender_res.fetchone()
+        if sender_row:
+            user_full_name, org_display_name = sender_row
+            sender_display_name = user_full_name or org_display_name or "Amplus Agent"
+        else:
+            sender_display_name = "Amplus Agent"
+
+        # 7. Recent activity from CustomerJourneyService (fully deduplicated)
+        from app.services.customer_journey_service import CustomerJourneyService
+        journey_service = CustomerJourneyService(db, org_id)
+        events = await journey_service.get_organization_activities(limit=50)
+        
         activities = []
-        for row in activity_res.fetchall():
-            subject = row[0]
-            sent_at = row[1]
-            received_at = row[2]
-            contact_name = row[3] or "Unknown Contact"
-            company_name = row[4] or "Unknown Company"
-            
-            event_time = sent_at or received_at or datetime.now(timezone.utc)
-            event_type = "Email Sent" if sent_at else "Reply Received"
-            details = f"Subject: '{subject}' to {contact_name}" if sent_at else f"AI analyzed response from {contact_name}"
-            
-            time_str = event_time.strftime("%b %d, %H:%M") if hasattr(event_time, "strftime") else str(event_time)
+        for evt in events:
+            try:
+                dt = datetime.fromisoformat(evt.timestamp)
+                time_str = dt.strftime("%b %d, %H:%M")
+            except Exception:
+                time_str = evt.timestamp
+
+            event_name = evt.title
+            details_str = evt.subtitle
+            if evt.event_type == 'email_sent':
+                event_name = "Email Sent"
+                details_str = evt.subtitle
+            elif evt.event_type == 'reply_received':
+                event_name = "🟢 Customer Replied"
+                details_str = evt.subtitle
+            elif evt.event_type == 'csv_imported':
+                event_name = "Customer Imported"
+                details_str = evt.subtitle
+            elif evt.event_type == 'followup_scheduled':
+                event_name = "Follow-up Scheduled"
+                details_str = evt.subtitle
 
             activities.append({
-                "event": event_type,
-                "details": details,
-                "time": time_str
+                "id": evt.id,
+                "time": time_str,
+                "timestamp": evt.timestamp,
+                "event": event_name,
+                "details": details_str,
+                "module": evt.module,
+                "event_type": evt.event_type,
+                "status": evt.status,
+                "title": evt.title,
+                "subtitle": evt.subtitle,
+                "icon": evt.icon,
+                "color": evt.color,
+                "expandable": evt.expandable,
+                "mail": evt.mail if evt.mail else None,
+                "attachments": evt.attachments or [],
+                "step_number": evt.step_number
             })
 
         # Engagement Widget Metrics
@@ -139,8 +217,11 @@ async def get_dashboard_metrics(
             "metrics": {
                 "total_contacts": total_contacts,
                 "total_campaigns": total_campaigns,
+                "customers_under_automation": customers_under_automation,
                 "total_emails_sent": total_emails,
-                "response_rate": f"{response_rate}%"
+                "response_rate": f"{response_rate}%",
+                "replies_received": total_replies,
+                "replies_today": replies_today
             },
             "leads": leads,
             "activities": activities,

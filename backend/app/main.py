@@ -40,6 +40,8 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import socket
+    socket.setdefaulttimeout(15.0)
     logger.info(
         "Starting up FastAPI application", 
         environment=settings.environment,
@@ -49,11 +51,13 @@ async def lifespan(app: FastAPI):
     
     # Initialize DB schemas/tables if missing
     from app.db.migrations import run_engagement_migrations, run_ai_reply_migrations, run_organization_settings_migrations, run_smtp_migrations
+    from app.db.migrations_scheduled import run_scheduled_migrations
     try:
         await run_engagement_migrations()
         await run_ai_reply_migrations()
         await run_organization_settings_migrations()
         await run_smtp_migrations()
+        await run_scheduled_migrations()
         from sqlalchemy import text
         from app.db.session import AsyncSessionLocal
         async with AsyncSessionLocal() as session:
@@ -127,11 +131,9 @@ async def lifespan(app: FastAPI):
     from app.db.session import AsyncSessionLocal
 
     async def run_stale_lock_recovery():
-        logger.info(
-            "Stale AI reply lock recovery worker started.",
-            interval_minutes=settings.ai_reply_recovery_interval_minutes,
-            lock_timeout_minutes=settings.ai_reply_lock_timeout_minutes
-        )
+        print("Recovery Worker Started", flush=True)
+        print(f"Recovery Scan Interval : {settings.ai_reply_recovery_interval_minutes} minutes", flush=True)
+        print(f"Stale Lock Timeout : {settings.ai_reply_lock_timeout_minutes} minutes", flush=True)
         # Immediate scan on startup
         try:
             async with AsyncSessionLocal() as session:
@@ -152,10 +154,54 @@ async def lifespan(app: FastAPI):
             except Exception as loop_err:
                 logger.error("Error in stale AI reply lock recovery loop", error=str(loop_err))
 
+    async def run_import_storage_cleanup():
+        import httpx
+        from sqlalchemy import text
+        logger.info("Import storage cleanup worker started.")
+        while True:
+            try:
+                await asyncio.sleep(60) # Scan every 60 seconds
+                async with AsyncSessionLocal() as session:
+                    res = await session.execute(text("""
+                        SELECT id, file_path 
+                        FROM import_batches 
+                        WHERE status IN ('completed', 'failed') AND file_path IS NOT NULL AND file_path != ''
+                    """))
+                    rows = res.fetchall()
+                    for row_id, file_path in rows:
+                        import urllib.parse
+                        safe_file_path = urllib.parse.quote(file_path)
+                        supabase_delete_url = f"{settings.supabase_url}/storage/v1/object/csv-imports/{safe_file_path}"
+                        async with httpx.AsyncClient() as client:
+                            del_res = await client.delete(
+                                supabase_delete_url,
+                                headers={
+                                    "apikey": settings.supabase_service_role_key,
+                                    "Authorization": f"Bearer {settings.supabase_service_role_key}"
+                                }
+                            )
+                            if del_res.status_code in (200, 204, 404):
+                                await session.execute(text("""
+                                    UPDATE import_batches 
+                                    SET file_path = NULL 
+                                    WHERE id = :id
+                                """), {"id": row_id})
+                                await session.commit()
+                                logger.info(f"Successfully cleaned up storage file for batch {row_id}")
+                            else:
+                                logger.warning(f"Supabase Storage deletion failed for batch {row_id}: {del_res.text}")
+            except asyncio.CancelledError:
+                logger.info("Import storage cleanup task cancelled.")
+                break
+            except Exception as e:
+                logger.error("Error in import storage cleanup loop", error=str(e))
+
     recovery_task = asyncio.create_task(run_stale_lock_recovery())
+    cleanup_task = asyncio.create_task(run_import_storage_cleanup())
 
     yield
     recovery_task.cancel()
+    cleanup_task.cancel()
     logger.info("Shutting down FastAPI application")
 
 
@@ -248,15 +294,42 @@ async def log_requests_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
         duration = int((time.time() - start_time) * 1000)
+        duration_s = duration / 1000.0
+        
+        # Color Access log logic
+        emoji = "🟢"
+        color = "\033[92m" # Green
+        if response.status_code >= 400:
+            emoji = "🔴"
+            color = "\033[91m" # Red
+        elif request.method == "POST":
+            emoji = "🔵"
+            color = "\033[94m" # Blue
+        elif request.method in ("PATCH", "PUT"):
+            emoji = "🟡"
+            color = "\033[93m" # Yellow
+        else:
+            if request.method == "GET":
+                emoji = "🟢"
+                color = "\033[92m"
+            else:
+                emoji = "🟡"
+                color = "\033[93m"
+
+        path = request.url.path
         if should_log_info:
-            logger.info(f"{request.method} {request.url.path} - {response.status_code} in {duration}ms")
+            log_line = f"{color}{emoji} {request.method:<8} {path:<30} {response.status_code}   {duration_s:.1f}s  [REQ-{req_id}]\033[0m"
+            print(log_line, flush=True)
+
         log_to_request_file(f"Response Sent: {response.status_code} in {duration}ms")
         return response
     except Exception as e:
         duration = int((time.time() - start_time) * 1000)
-        tb_str = traceback.format_exc()
+        duration_s = duration / 1000.0
+        log_line = f"\033[91m🔴 {request.method:<8} {request.url.path:<30} 500   {duration_s:.1f}s  [REQ-{req_id}]\033[0m"
+        print(log_line, flush=True)
         
-        # Log details to file
+        tb_str = traceback.format_exc()
         log_to_request_file(f"HTTP 500 ERROR:\n{tb_str}")
         
         logger.exception(
