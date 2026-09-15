@@ -7,6 +7,15 @@ Ensuring consistent log format across all modules, and explicitly redacting sens
 
 import logging
 import sys
+import io
+
+# Ensure stdout and stderr on Windows use UTF-8 and replace unencodable characters safely
+if sys.platform == "win32":
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import structlog
 
@@ -24,6 +33,10 @@ def recursive_sanitize(val, key_name="", depth=0):
     key_lower = str(key_name).lower()
     
     if isinstance(val, str):
+        try:
+            val = val.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8")
+        except Exception:
+            pass
         val_len = len(val)
         
         # 1. Traceback

@@ -7,9 +7,15 @@ class CustomerService:
     def __init__(self, db: AsyncSession, org_id: UUID):
         self.repo = CustomerRepository(db, org_id)
 
-    def calculate_readiness(self, email: Optional[str], company: Optional[str]) -> str:
+    def calculate_readiness(self, email: Optional[str], company: Optional[str], validation_status: Optional[str] = None) -> str:
         if not email or "@" not in email:
             return "EMAIL_MISSING"
+        if validation_status == "invalid":
+            return "NOT_ELIGIBLE"
+        from app.core.normalization import validate_email_syntax
+        is_valid, _ = validate_email_syntax(email)
+        if not is_valid:
+            return "NOT_ELIGIBLE"
         if not company:
             return "NOT_ELIGIBLE"
         return "READY"
@@ -43,9 +49,12 @@ class CustomerService:
         rows, total = await self.repo.get_customers(page, limit, q, industry, country, segment)
         customers = []
         for r in rows:
-            c_id, company, name, email, ind, cntry, seg, last_email_date, created_at, enrollment_status, exit_reason = r
-            readiness = self.calculate_readiness(email, company)
+            c_id, company, name, email, ind, cntry, designation, phone, website, linkedin, address, city, state, shipment_mode, trade_direction, customer_type, trade_region, goods, raw_company, raw_contact, seg, last_email_date, created_at, enrollment_status, exit_reason, val_status, supp_id, supp_reason, b_reason, supp_at = r
+            readiness = self.calculate_readiness(email, company, val_status)
             status_val = self.calculate_status(enrollment_status, exit_reason)
+            is_suppressed = supp_id is not None
+            if is_suppressed:
+                status_val = "hard_bounce"
 
             customers.append({
                 "id": c_id,
@@ -54,11 +63,29 @@ class CustomerService:
                 "contact_email": email,
                 "industry": ind,
                 "country": cntry,
+                "designation": designation,
+                "phone": phone,
+                "website": website,
+                "linkedin": linkedin,
+                "address": address,
+                "city": city,
+                "state": state,
+                "shipment_mode": shipment_mode,
+                "trade_direction": trade_direction,
+                "customer_type": customer_type,
+                "trade_region": trade_region,
+                "goods_description": goods,
+                "raw_company_name": raw_company,
+                "raw_contact_name": raw_contact,
                 "segment": seg,
                 "engagement_readiness": readiness,
                 "last_email": str(last_email_date) if last_email_date else None,
                 "imported_on": created_at.strftime("%Y-%m-%d") if created_at else "",
-                "status": status_val
+                "status": status_val,
+                "is_suppressed": is_suppressed,
+                "suppression_reason": supp_reason,
+                "bounce_reason": b_reason,
+                "suppressed_at": supp_at.isoformat() if supp_at else None
             })
         return customers, total
 
@@ -67,9 +94,12 @@ class CustomerService:
         if not row:
             return None
 
-        c_id, company, name, email, ind, cntry, seg, last_email_date, created_at, batch_id, batch_name, batch_date, enrollment_status, exit_reason = row
+        c_id, company, name, email, ind, cntry, designation, phone, website, linkedin, address, city, state, shipment_mode, trade_direction, customer_type, trade_region, goods, raw_company, raw_contact, seg, last_email_date, created_at, batch_id, batch_name, batch_date, enrollment_status, exit_reason, supp_id, supp_reason, b_reason, supp_at = row
         readiness = self.calculate_readiness(email, company)
         status_val = self.calculate_status(enrollment_status, exit_reason)
+        is_suppressed = supp_id is not None
+        if is_suppressed:
+            status_val = "hard_bounce"
 
         # Query database for engagement timeline and stats
         from sqlalchemy import text
@@ -127,11 +157,29 @@ class CustomerService:
             "contact_email": email,
             "industry": ind,
             "country": cntry,
+            "designation": designation,
+            "phone": phone,
+            "website": website,
+            "linkedin": linkedin,
+            "address": address,
+            "city": city,
+            "state": state,
+            "shipment_mode": shipment_mode,
+            "trade_direction": trade_direction,
+            "customer_type": customer_type,
+            "trade_region": trade_region,
+            "goods_description": goods,
+            "raw_company_name": raw_company,
+            "raw_contact_name": raw_contact,
             "segment": seg,
             "engagement_readiness": readiness,
             "last_email": str(last_email_date) if last_email_date else None,
             "imported_on": created_at.strftime("%Y-%m-%d") if created_at else "",
             "status": status_val,
+            "is_suppressed": is_suppressed,
+            "suppression_reason": supp_reason,
+            "bounce_reason": b_reason,
+            "suppressed_at": supp_at.isoformat() if supp_at else None,
             "import_batch_id": batch_id,
             "import_batch_name": batch_name,
             "total_emails_sent": total_emails,

@@ -71,6 +71,8 @@ interface QueueItem {
   draft_status: string;
   ai_rewrite_enabled: boolean;
   ai_draft_body: string | null;
+  is_suppressed?: boolean;
+  skip_reason?: string | null;
 }
 
 export default function FollowUpsModulePage() {
@@ -618,15 +620,21 @@ export default function FollowUpsModulePage() {
                               {item.attachment_profile_name || <span className="text-text-muted italic">None</span>}
                             </td>
                             <td className="py-3 select-none">
-                              <Badge
-                                variant={
-                                  item.draft_status === 'completed' ? 'success' :
-                                    item.draft_status === 'paused' ? 'warning' :
-                                      item.draft_status === 'cancelled' ? 'neutral' : 'primary'
-                                }
-                              >
-                                {item.draft_status}
-                              </Badge>
+                              {item.draft_status === 'skipped' || item.is_suppressed ? (
+                                <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300" title="Recipient has a confirmed hard bounce.">
+                                  Skipped — Hard Bounce
+                                </span>
+                              ) : (
+                                <Badge
+                                  variant={
+                                    item.draft_status === 'completed' ? 'success' :
+                                      item.draft_status === 'paused' ? 'warning' :
+                                        item.draft_status === 'cancelled' ? 'neutral' : 'primary'
+                                  }
+                                >
+                                  {item.draft_status}
+                                </Badge>
+                              )}
                             </td>
                             <td className="py-3 text-right space-x-1 select-none">
                               {item.ai_draft_body && (

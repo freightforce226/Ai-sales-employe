@@ -4,7 +4,7 @@ from sqlalchemy import text
 import uuid
 import json
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, UUID4
 
 from app.db.session import get_db_session
@@ -66,6 +66,8 @@ class FollowUpQueueItemResponse(BaseModel):
     ai_rewrite_enabled: bool
     ai_draft_body: Optional[str] = None
     current_schedule: bool = False
+    is_suppressed: bool = False
+    skip_reason: Optional[str] = None
 
 class RescheduleRequest(BaseModel):
     smart_instruction: str
@@ -339,10 +341,12 @@ async def get_follow_up_queue(
                 f.ai_rewrite_enabled,
                 f.ai_draft_body,
                 f.status,
-                f.created_at
+                f.created_at,
+                es.id AS suppression_id
             FROM follow_up_schedule f
             JOIN customers c ON f.customer_id = c.id
             LEFT JOIN follow_up_attachment_profiles ap ON f.attachment_profile_id = ap.id
+            LEFT JOIN email_suppressions es ON es.organization_id = :org_id AND lower(es.email_address) = lower(c.contact_email)
             WHERE f.organization_id = :org_id AND c.deleted_at IS NULL
             ORDER BY f.scheduled_datetime ASC
         """),
@@ -373,6 +377,8 @@ async def get_follow_up_queue(
         is_current = False
         if cust_id in newest_pending_by_customer and newest_pending_by_customer[cust_id][0] == r[0]:
             is_current = True
+        
+        is_supp = r[12] is not None or r[7] == "skipped"
             
         queue.append(FollowUpQueueItemResponse(
             id=r[0],
@@ -382,10 +388,12 @@ async def get_follow_up_queue(
             step_number=r[4] or 1,
             attachment_profile_name=r[5],
             scheduled_datetime=r[6].isoformat() if r[6] else None,
-            draft_status=r[7] or "scheduled",
+            draft_status="skipped" if is_supp else (r[7] or "scheduled"),
             ai_rewrite_enabled=r[8] if r[8] is not None else True,
             ai_draft_body=r[9],
-            current_schedule=is_current
+            current_schedule=is_current,
+            is_suppressed=is_supp,
+            skip_reason="hard_bounce_suppressed" if is_supp else None
         ))
     return queue
 
@@ -893,6 +901,12 @@ class FollowUpContextResponse(BaseModel):
     reply_reason: Optional[str] = None
     last_inbound_email: Optional[FollowUpContextEmail] = None
     last_outbound_email: Optional[FollowUpContextEmail] = None
+    # Authoritative Thread Lineage Metadata
+    source_email_log_id: Optional[str] = None
+    parent_message_id: Optional[str] = None
+    parent_graph_message_id: Optional[str] = None
+    parent_internet_message_id: Optional[str] = None
+
 
 
 async def check_and_register_reply(
@@ -1327,21 +1341,44 @@ async def get_follow_up_context(
             if val and len(str(val).strip()) > 2:
                 sig_strip_list.append(str(val).strip())
 
-    # 6. Previous email log (sanitized)
-    prev_email = None
-    if source_email_log_id:
-        email_res = await db.execute(
-            text("SELECT subject, body, sent_at FROM email_log WHERE id = :email_id"),
-            {"email_id": source_email_log_id}
+    # 6. Authoritative Lineage Parent Email Log Resolution & Strict Validation
+    if not source_email_log_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Unresolvable follow-up parent lineage. Cannot generate follow-up without valid parent email log."
         )
-        email_row = email_res.fetchone()
-        if email_row:
-            sanitized_body = sanitize_llm_email_body(email_row[1], sig_strip_list)
-            prev_email = FollowUpContextEmail(
-                subject=email_row[0],
-                body=sanitized_body,
-                sent_at=email_row[2].isoformat() if email_row[2] else None
-            )
+
+    email_res = await db.execute(
+        text("SELECT id, subject, body, sent_at, graph_message_id, internet_message_id, organization_id, customer_id FROM email_log WHERE id = :email_id"),
+        {"email_id": source_email_log_id}
+    )
+    email_row = email_res.fetchone()
+    if not email_row:
+        raise HTTPException(
+            status_code=422,
+            detail="Unresolvable follow-up parent lineage. Referenced parent email_log record does not exist."
+        )
+
+    parent_log_id, p_subj, p_body, p_sent_at, p_graph_id, p_internet_id, p_org_id, p_cust_id = email_row
+
+    # Tenant and Customer Boundary Validation
+    if p_org_id != payload.organization_id or p_cust_id != payload.customer_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Unresolvable follow-up parent lineage. Parent email log belongs to a different tenant or customer."
+        )
+
+    sanitized_body = sanitize_llm_email_body(p_body, sig_strip_list)
+    prev_email = FollowUpContextEmail(
+        subject=p_subj,
+        body=sanitized_body,
+        sent_at=p_sent_at.isoformat() if p_sent_at else None
+    )
+
+    resolved_source_log_id = str(parent_log_id)
+    resolved_parent_msg_id = str(parent_log_id)
+    resolved_parent_graph_id = str(p_graph_id) if p_graph_id else None
+    resolved_parent_internet_id = str(p_internet_id) if p_internet_id else None
 
     # 7. Email Thread (sanitized)
     thread_res = await db.execute(
@@ -1451,7 +1488,11 @@ async def get_follow_up_context(
         reply_thread_id=reply_info.get("reply_thread_id"),
         reply_reason=reply_info.get("reply_reason"),
         last_inbound_email=reply_info.get("last_inbound_email"),
-        last_outbound_email=reply_info.get("last_outbound_email")
+        last_outbound_email=reply_info.get("last_outbound_email"),
+        source_email_log_id=resolved_source_log_id,
+        parent_message_id=resolved_parent_msg_id,
+        parent_graph_message_id=resolved_parent_graph_id,
+        parent_internet_message_id=resolved_parent_internet_id
     )
 
 
@@ -1700,13 +1741,21 @@ async def complete_followup_schedule(
             )
     elif not (reply_detected and stop_on_reply):
         try:
+            # Resolve actual email_log ID for payload.message_id to use as parent source for Step N+1
+            new_log_res = await db.execute(
+                text("SELECT id FROM email_log WHERE (graph_message_id = :msg_id OR internet_message_id = :msg_id) AND organization_id = :org_id AND direction = 'outbound' AND marketing_campaign_id IS NULL ORDER BY sent_at DESC LIMIT 1"),
+                {"msg_id": payload.message_id, "org_id": organization_id}
+            )
+            new_log_row = new_log_res.fetchone()
+            step_n_log_id = new_log_row[0] if new_log_row else source_email_log_id
+
             async with db.begin_nested():
                 enqueue_res = await db.execute(
                     text("SELECT public.enqueue_followup_step(:org_id, :cust_id, :log_id, :step_num)"),
                     {
                         "org_id": organization_id,
                         "cust_id": customer_id,
-                        "log_id": source_email_log_id,
+                        "log_id": step_n_log_id,
                         "step_num": next_step
                     }
                 )
@@ -1714,7 +1763,8 @@ async def complete_followup_schedule(
                 if new_fid:
                     next_step_created = True
             await db.commit()
-            logger.info("Transaction 2: Successfully enqueued next follow-up step", new_schedule_id=str(new_fid) if new_fid else "None")
+            logger.info("Transaction 2: Successfully enqueued next follow-up step", new_schedule_id=str(new_fid) if new_fid else "None", step_n_log_id=str(step_n_log_id))
+
         except Exception as e:
             await db.rollback()
             logger.error(
@@ -1817,4 +1867,139 @@ async def trigger_inbound_polling(
     from app.services.inbound_sync_service import InboundSyncService
     service = InboundSyncService(db)
     return await service.sync_all_active_mailboxes()
+
+
+# --- FOLLOW-UP AI GENERATION ENDPOINT (BACKEND REPRODUCTION & 24H STEP CACHING) ---
+
+class FollowUpCustomerInfo(BaseModel):
+    name: Optional[str] = None
+    company: Optional[str] = None
+
+class FollowUpOrgInfo(BaseModel):
+    name: Optional[str] = None
+
+class FollowUpEmailContextInfo(BaseModel):
+    subject: Optional[str] = None
+    body: Optional[str] = None
+
+class FollowUpGenerateEmailRequest(BaseModel):
+    organization_id: UUID4
+    customer_id: UUID4
+    step_number: int
+    customer: Optional[FollowUpCustomerInfo] = None
+    organization: Optional[FollowUpOrgInfo] = None
+    previous_email: Optional[FollowUpEmailContextInfo] = None
+    email_thread: Optional[List[Dict[str, Any]]] = None
+    source_email_log_id: Optional[str] = None
+    parent_message_id: Optional[str] = None
+    parent_graph_message_id: Optional[str] = None
+    parent_internet_message_id: Optional[str] = None
+
+class FollowUpGenerateEmailResponse(BaseModel):
+    success: bool
+    subject: str
+    body: str
+    llm_called: bool
+    tokens_consumed: int
+    cache_hit: bool
+    step_number: int
+    model_used: str
+    generation_time_ms: int
+    # Authoritative Thread Lineage Metadata
+    source_email_log_id: Optional[str] = None
+    parent_message_id: Optional[str] = None
+    parent_graph_message_id: Optional[str] = None
+    parent_internet_message_id: Optional[str] = None
+
+
+@router.post("/generate-email", response_model=FollowUpGenerateEmailResponse, tags=["Follow-ups Manager"], dependencies=[Depends(verify_api_key)])
+async def generate_followup_email_endpoint(
+    payload: FollowUpGenerateEmailRequest,
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    """
+    Backend AI Generation Endpoint for Follow-Up Emails.
+    Implements 24-Hour Step-Wise DB Caching, Deterministic Personalization, and Multi-Model Fallback.
+    """
+    from app.services.follow_up_ai_service import FollowUpAIService
+    service = FollowUpAIService(db)
+
+    cust_name = payload.customer.name if payload.customer else None
+    cust_company = payload.customer.company if payload.customer else None
+    org_name = payload.organization.name if payload.organization else None
+    prev_subj = payload.previous_email.subject if payload.previous_email else None
+    prev_body = payload.previous_email.body if payload.previous_email else None
+
+    # Resolve parent details from source_email_log_id if available to enrich lineage response
+    resolved_src_id = payload.source_email_log_id or payload.parent_message_id
+    resolved_parent_id = payload.parent_message_id or payload.source_email_log_id
+    resolved_graph_id = payload.parent_graph_message_id
+    resolved_internet_id = payload.parent_internet_message_id
+
+    if resolved_src_id and (not resolved_graph_id or not resolved_internet_id):
+        try:
+            log_res = await db.execute(
+                text("SELECT id, graph_message_id, internet_message_id FROM email_log WHERE id::text = :e_id AND organization_id = :org_id AND customer_id = :cust_id"),
+                {"e_id": resolved_src_id, "org_id": payload.organization_id, "cust_id": payload.customer_id}
+            )
+            log_row = log_res.fetchone()
+            if log_row:
+                resolved_src_id = str(log_row[0])
+                resolved_parent_id = str(log_row[0])
+                resolved_graph_id = str(log_row[1]) if log_row[1] else None
+                resolved_internet_id = str(log_row[2]) if log_row[2] else None
+        except Exception:
+            pass
+
+    # Fetch verified CRM customer attributes from database
+    cust_industry = None
+    cust_goods_desc = None
+    cust_shipment_mode = None
+    cust_trade_region = None
+    cust_trade_direction = None
+
+    try:
+        cust_db_res = await db.execute(
+            text("""
+                SELECT industry, goods_description, shipment_mode, trade_region, trade_direction 
+                FROM customers 
+                WHERE id = :cust_id AND organization_id = :org_id AND deleted_at IS NULL
+            """),
+            {"cust_id": payload.customer_id, "org_id": payload.organization_id}
+        )
+        cust_db_row = cust_db_res.fetchone()
+        if cust_db_row:
+            cust_industry = cust_db_row[0]
+            cust_goods_desc = cust_db_row[1]
+            cust_shipment_mode = cust_db_row[2]
+            cust_trade_region = cust_db_row[3]
+            cust_trade_direction = cust_db_row[4]
+    except Exception as fetch_err:
+        logger.warning("Failed to fetch verified customer attributes for follow-up prompt", error=str(fetch_err))
+
+    res = await service.generate_followup_email(
+        organization_id=payload.organization_id,
+        customer_id=payload.customer_id,
+        step_number=payload.step_number,
+        customer_name=cust_name,
+        customer_company=cust_company,
+        organization_name=org_name,
+        previous_subject=prev_subj,
+        previous_body=prev_body,
+        email_thread=payload.email_thread,
+        industry=cust_industry,
+        goods_description=cust_goods_desc,
+        shipment_mode=cust_shipment_mode,
+        trade_region=cust_trade_region,
+        trade_direction=cust_trade_direction
+    )
+
+    res["source_email_log_id"] = resolved_src_id
+    res["parent_message_id"] = resolved_parent_id
+    res["parent_graph_message_id"] = resolved_graph_id
+    res["parent_internet_message_id"] = resolved_internet_id
+
+    return FollowUpGenerateEmailResponse(**res)
+
 

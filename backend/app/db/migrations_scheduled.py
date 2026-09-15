@@ -38,7 +38,38 @@ async def run_scheduled_migrations():
             await session.execute(text("ALTER TABLE public.email_log ADD COLUMN IF NOT EXISTS internet_message_id VARCHAR;"))
             await session.execute(text("ALTER TABLE public.email_log ADD COLUMN IF NOT EXISTS \"references\" TEXT;"))
             await session.execute(text("ALTER TABLE public.email_log ADD COLUMN IF NOT EXISTS in_reply_to VARCHAR;"))
-            logger.info("Successfully updated follow_up_schedule and email_log table columns.")
+            
+            # Alter customers table to add optional V2 fields
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS designation TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS phone TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS website TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS linkedin TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS address TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS city TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS state TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS shipment_mode TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS trade_direction TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS customer_type TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS trade_region TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS goods_description TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS raw_company_name TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS raw_contact_name TEXT;"))
+            
+            # Alter customers table to add email validation columns
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS email_validation_status VARCHAR DEFAULT 'valid';"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS raw_contact_email TEXT;"))
+            await session.execute(text("ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS email_validation_error TEXT;"))
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_customers_validation_status ON public.customers(email_validation_status);"))
+            
+            logger.info("Successfully updated follow_up_schedule, email_log, and customers table columns.")
+
+            # Performance Indexes for Inbound Sync Optimization
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_email_log_graph_msg_id ON public.email_log(graph_message_id) WHERE graph_message_id IS NOT NULL;"))
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_email_log_internet_msg_id ON public.email_log(internet_message_id) WHERE internet_message_id IS NOT NULL;"))
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_customers_email_org ON public.customers(contact_email, organization_id);"))
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_email_log_org_direction ON public.email_log(organization_id, direction);"))
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_email_log_customer_outbound ON public.email_log(customer_id, organization_id, direction, sent_at DESC) WHERE direction = 'outbound';"))
+            logger.info("Successfully created inbound sync performance indexes.")
 
             # Recreate get_engagement_eligible_customers
             await session.execute(text("""
@@ -94,6 +125,16 @@ async def run_scheduled_migrations():
                         and el.direction = 'outbound'
                         and el.email_type = 'engagement'
                         and el.sent_at > now() - (p_min_gap_days * interval '1 day')
+                    )
+                    and not exists (
+                      select 1 from campaign_enrollments ce
+                      where ce.customer_id = c.id
+                        and ce.enrollment_status = 'active'
+                    )
+                    and not exists (
+                      select 1 from follow_up_schedule f
+                      where f.customer_id = c.id
+                        and f.status = 'pending'
                     )
                   order by c.last_contact_date asc nulls first
                   limit p_batch_limit
@@ -466,7 +507,7 @@ async def run_scheduled_migrations():
                     p_workflow_execution_id TEXT,
                     p_trigger_type TEXT,
                     p_started_by_user UUID,
-                    p_timeout_minutes INTEGER DEFAULT 30
+                    p_timeout_minutes INTEGER DEFAULT 15
                 )
                 RETURNS TABLE (
                     already_running BOOLEAN,
@@ -563,7 +604,7 @@ async def run_scheduled_migrations():
                     p_workflow_execution_id TEXT,
                     p_trigger_type TEXT,
                     p_started_by_user UUID,
-                    p_timeout_minutes INTEGER DEFAULT 30
+                    p_timeout_minutes INTEGER DEFAULT 15
                 )
                 RETURNS TABLE (
                     already_running BOOLEAN,
@@ -641,36 +682,48 @@ async def run_scheduled_migrations():
             await session.execute(text("""
                 CREATE OR REPLACE FUNCTION public.refresh_customer_segment_trigger()
                 RETURNS TRIGGER AS $$
+                DECLARE
+                  v_needs_refresh BOOLEAN := FALSE;
                 BEGIN
-                  IF EXISTS (
-                    SELECT 1 FROM customer_segments 
-                    WHERE customer_id = NEW.id AND computed_at::date = CURRENT_DATE
-                  ) THEN
-                    UPDATE customer_segments
-                    SET segment_type = (CASE
+                  IF TG_OP = 'INSERT' THEN
+                    v_needs_refresh := TRUE;
+                  ELSIF TG_OP = 'UPDATE' THEN
+                    IF OLD.last_contact_date IS DISTINCT FROM NEW.last_contact_date THEN
+                      v_needs_refresh := TRUE;
+                    END IF;
+                  END IF;
+
+                  IF v_needs_refresh THEN
+                    IF EXISTS (
+                      SELECT 1 FROM customer_segments 
+                      WHERE customer_id = NEW.id AND computed_at::date = CURRENT_DATE
+                    ) THEN
+                      UPDATE customer_segments
+                      SET segment_type = (CASE
+                            WHEN NEW.last_contact_date IS NULL THEN 'dormant'
+                            WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '90 days') THEN 'dormant'
+                            WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '31 days') THEN 'inactive'
+                            ELSE 'active'
+                          END)::segment_type,
+                          computed_by = 'trigger_contact_date_update',
+                          computed_at = NOW()
+                      WHERE customer_id = NEW.id AND computed_at::date = CURRENT_DATE;
+                    ELSE
+                      INSERT INTO customer_segments (id, organization_id, customer_id, segment_type, computed_by, computed_at)
+                      VALUES (
+                        gen_random_uuid(),
+                        NEW.organization_id,
+                        NEW.id,
+                        (CASE
                           WHEN NEW.last_contact_date IS NULL THEN 'dormant'
                           WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '90 days') THEN 'dormant'
                           WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '31 days') THEN 'inactive'
                           ELSE 'active'
                         END)::segment_type,
-                        computed_by = 'trigger_contact_date_update',
-                        computed_at = NOW()
-                    WHERE customer_id = NEW.id AND computed_at::date = CURRENT_DATE;
-                  ELSE
-                    INSERT INTO customer_segments (id, organization_id, customer_id, segment_type, computed_by, computed_at)
-                    VALUES (
-                      gen_random_uuid(),
-                      NEW.organization_id,
-                      NEW.id,
-                      (CASE
-                        WHEN NEW.last_contact_date IS NULL THEN 'dormant'
-                        WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '90 days') THEN 'dormant'
-                        WHEN NEW.last_contact_date < (CURRENT_DATE - INTERVAL '31 days') THEN 'inactive'
-                        ELSE 'active'
-                      END)::segment_type,
-                      'trigger_contact_date_update',
-                      NOW()
-                    );
+                        'trigger_contact_date_update',
+                        NOW()
+                      );
+                    END IF;
                   END IF;
                   RETURN NEW;
                 END;
@@ -681,7 +734,7 @@ async def run_scheduled_migrations():
             """))
             await session.execute(text("""
                 CREATE TRIGGER trg_refresh_segment_on_contact
-                AFTER UPDATE OF last_contact_date ON public.customers
+                AFTER INSERT OR UPDATE ON public.customers
                 FOR EACH ROW
                 EXECUTE FUNCTION public.refresh_customer_segment_trigger();
             """))
@@ -749,7 +802,13 @@ async def run_scheduled_migrations():
                     c.organization_id,
                     (SELECT id FROM campaigns WHERE organization_id = c.organization_id LIMIT 1) as campaign_id,
                     c.id as customer_id,
-                    'completed'::public.enrollment_status as enrollment_status,
+                    (CASE
+                      WHEN EXISTS (
+                        SELECT 1 FROM follow_up_schedule f
+                        WHERE f.customer_id = c.id AND CAST(f.status AS text) IN ('pending', 'scheduled', 'paused')
+                      ) THEN 'active'::public.enrollment_status
+                      ELSE 'completed'::public.enrollment_status
+                    END) as enrollment_status,
                     c.created_at as enrolled_at,
                     NOW() as created_at,
                     NOW() as updated_at
@@ -759,6 +818,28 @@ async def run_scheduled_migrations():
                   AND (
                     EXISTS (SELECT 1 FROM follow_up_schedule f WHERE f.customer_id = c.id)
                     OR EXISTS (SELECT 1 FROM email_log e WHERE e.customer_id = c.id AND e.direction = 'outbound')
+                  );
+            """))
+
+            # A.2 Backfill missing customer segments
+            await session.execute(text("""
+                INSERT INTO customer_segments (id, organization_id, customer_id, segment_type, computed_by, computed_at)
+                SELECT 
+                    gen_random_uuid(),
+                    c.organization_id,
+                    c.id,
+                    (CASE
+                        WHEN c.last_contact_date IS NULL THEN 'dormant'::public.segment_type
+                        WHEN c.last_contact_date < (CURRENT_DATE - INTERVAL '90 days') THEN 'dormant'::public.segment_type
+                        WHEN c.last_contact_date < (CURRENT_DATE - INTERVAL '31 days') THEN 'inactive'::public.segment_type
+                        ELSE 'active'::public.segment_type
+                    END),
+                    'backfill_missing_segments',
+                    NOW()
+                FROM public.customers c
+                WHERE c.deleted_at IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM customer_segments cs WHERE cs.customer_id = c.id
                   );
             """))
 

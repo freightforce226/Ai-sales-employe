@@ -340,10 +340,327 @@ async def run_smtp_migrations():
             logger.error("Failed to update active_organizations_for_engagement view", error=str(view_err))
 
 
+async def run_marketing_migrations():
+    """
+    Executes production-grade SQL migration scripts to create tables for:
+    - marketing_campaigns
+    - marketing_campaign_contents
+    - marketing_campaign_recipients
+    - marketing_ai_configs
+    Also adds marketing_campaign_id to email_log.
+    """
+    logger.info("Starting database schema migrations for Marketing Engine Foundation...")
+    async with AsyncSessionLocal() as session:
+        # 1. marketing_campaigns
+        try:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS marketing_campaigns (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    audience_filters JSONB,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    scheduled_at TIMESTAMP WITH TIME ZONE,
+                    started_at TIMESTAMP WITH TIME ZONE,
+                    completed_at TIMESTAMP WITH TIME ZONE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    CONSTRAINT uq_marketing_campaigns_org_name UNIQUE (organization_id, name)
+                )
+            """))
+            await session.commit()
+            logger.info("Verified table: marketing_campaigns")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed migrating marketing_campaigns", error=str(e))
+
+        # Add campaign_type and custom_prompt columns to marketing_campaigns
+        for col_name, col_type in [("campaign_type", "TEXT"), ("custom_prompt", "TEXT")]:
+            try:
+                await session.execute(text(f"ALTER TABLE marketing_campaigns ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
+                await session.commit()
+                logger.info(f"Verified column: {col_name} exists in marketing_campaigns")
+            except Exception as col_err:
+                await session.rollback()
+                logger.error(f"Failed to add column {col_name} to marketing_campaigns", error=str(col_err))
+
+        # 2. Indexes for marketing_campaigns
+        for idx_name, idx_def in [
+            ("idx_mkt_campaigns_org", "CREATE INDEX IF NOT EXISTS idx_mkt_campaigns_org ON marketing_campaigns(organization_id)"),
+            ("idx_mkt_campaigns_status", "CREATE INDEX IF NOT EXISTS idx_mkt_campaigns_status ON marketing_campaigns(status)")
+        ]:
+            try:
+                await session.execute(text(idx_def))
+                await session.commit()
+                logger.info(f"Verified index: {idx_name}")
+            except Exception as idx_err:
+                await session.rollback()
+                logger.error(f"Failed to create index {idx_name}", error=str(idx_err))
+
+        # 3. marketing_campaign_contents
+        try:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS marketing_campaign_contents (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    campaign_id UUID NOT NULL REFERENCES marketing_campaigns(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    subject TEXT,
+                    preview_text TEXT,
+                    html_body TEXT,
+                    plain_text TEXT,
+                    prompt_version TEXT,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                )
+            """))
+            await session.commit()
+            logger.info("Verified table: marketing_campaign_contents")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed migrating marketing_campaign_contents", error=str(e))
+
+        # Add content_key and attachments columns to marketing_campaign_contents
+        for col_name, col_type in [("content_key", "TEXT"), ("attachments", "JSONB DEFAULT '[]'::jsonb")]:
+            try:
+                await session.execute(text(f"ALTER TABLE marketing_campaign_contents ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
+                await session.commit()
+                logger.info(f"Verified column: {col_name} exists in marketing_campaign_contents")
+            except Exception as col_err:
+                await session.rollback()
+                logger.error(f"Failed to add column {col_name} to marketing_campaign_contents", error=str(col_err))
+
+        # 4. Indexes for marketing_campaign_contents
+        for idx_name, idx_def in [
+            ("idx_mkt_contents_campaign", "CREATE INDEX IF NOT EXISTS idx_mkt_contents_campaign ON marketing_campaign_contents(campaign_id)"),
+            ("idx_mkt_contents_key", "CREATE INDEX IF NOT EXISTS idx_mkt_contents_key ON marketing_campaign_contents(content_key)")
+        ]:
+            try:
+                await session.execute(text(idx_def))
+                await session.commit()
+                logger.info(f"Verified index: {idx_name}")
+            except Exception as idx_err:
+                await session.rollback()
+                logger.error(f"Failed to create index {idx_name}", error=str(idx_err))
+
+        # 5. marketing_campaign_recipients
+        try:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS marketing_campaign_recipients (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                    campaign_id UUID NOT NULL REFERENCES marketing_campaigns(id) ON DELETE CASCADE,
+                    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    sent_at TIMESTAMP WITH TIME ZONE,
+                    failed_at TIMESTAMP WITH TIME ZONE,
+                    claimed_at TIMESTAMP WITH TIME ZONE,
+                    CONSTRAINT uq_mkt_recipients_camp_cust UNIQUE (campaign_id, customer_id)
+                )
+            """))
+            await session.commit()
+            
+            # Ensure column exists for existing installations
+            await session.execute(text("ALTER TABLE marketing_campaign_recipients ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP WITH TIME ZONE"))
+            await session.commit()
+            
+            logger.info("Verified table: marketing_campaign_recipients")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed migrating marketing_campaign_recipients", error=str(e))
+
+        # 6. Indexes for marketing_campaign_recipients
+        for idx_name, idx_def in [
+            ("idx_mkt_recip_org", "CREATE INDEX IF NOT EXISTS idx_mkt_recip_org ON marketing_campaign_recipients(organization_id)"),
+            ("idx_mkt_recip_campaign", "CREATE INDEX IF NOT EXISTS idx_mkt_recip_campaign ON marketing_campaign_recipients(campaign_id)"),
+            ("idx_mkt_recip_customer", "CREATE INDEX IF NOT EXISTS idx_mkt_recip_customer ON marketing_campaign_recipients(customer_id)"),
+            ("idx_mkt_recip_status", "CREATE INDEX IF NOT EXISTS idx_mkt_recip_status ON marketing_campaign_recipients(status)"),
+            ("idx_mkt_recip_claimed", "CREATE INDEX IF NOT EXISTS idx_mkt_recip_claimed ON marketing_campaign_recipients(claimed_at)")
+        ]:
+            try:
+                await session.execute(text(idx_def))
+                await session.commit()
+                logger.info(f"Verified index: {idx_name}")
+            except Exception as idx_err:
+                await session.rollback()
+                logger.error(f"Failed to create index {idx_name}", error=str(idx_err))
+
+        # 7. Add nullable marketing_campaign_id column to email_log
+        try:
+            await session.execute(text("ALTER TABLE email_log ADD COLUMN IF NOT EXISTS marketing_campaign_id UUID REFERENCES marketing_campaigns(id) ON DELETE SET NULL"))
+            await session.commit()
+            logger.info("Verified column marketing_campaign_id exists in email_log")
+        except Exception as col_err:
+            await session.rollback()
+            logger.error("Failed to add column marketing_campaign_id to email_log", error=str(col_err))
+
+        # 8. Index on email_log(marketing_campaign_id)
+        try:
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_email_log_mkt_campaign ON email_log(marketing_campaign_id)"))
+            await session.commit()
+            logger.info("Verified index: idx_email_log_mkt_campaign")
+        except Exception as idx_err:
+            await session.rollback()
+            logger.error("Failed to create index idx_email_log_mkt_campaign", error=str(idx_err))
+
+        # Unique index on email_log(marketing_campaign_id, customer_id) for campaign duplicate prevention
+        try:
+            await session.execute(text("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_email_log_mkt_campaign_customer 
+                ON email_log(marketing_campaign_id, customer_id) 
+                WHERE marketing_campaign_id IS NOT NULL
+            """))
+            await session.commit()
+            logger.info("Verified unique index: uq_email_log_mkt_campaign_customer")
+        except Exception as uq_err:
+            await session.rollback()
+            logger.error("Failed to create unique index uq_email_log_mkt_campaign_customer", error=str(uq_err))
+
+        # 9. marketing_ai_configs
+        try:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS marketing_ai_configs (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                    system_prompt TEXT NOT NULL,
+                    campaign_prompt TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT 'gemini-2.5-flash',
+                    temperature NUMERIC NOT NULL DEFAULT 0.7,
+                    prompt_version TEXT NOT NULL DEFAULT '1.0',
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    CONSTRAINT uq_mkt_ai_configs_org UNIQUE (organization_id)
+                )
+            """))
+            await session.commit()
+            logger.info("Verified table: marketing_ai_configs")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed migrating marketing_ai_configs", error=str(e))
+
+        # Index for marketing_ai_configs
+        try:
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_mkt_ai_configs_org ON marketing_ai_configs(organization_id)"))
+            await session.commit()
+            logger.info("Verified index: idx_mkt_ai_configs_org")
+        except Exception as idx_err:
+            await session.rollback()
+            logger.error("Failed to create index idx_mkt_ai_configs_org", error=str(idx_err))
+
+
+async def run_bounce_detection_migrations():
+    """
+    Phase 2A — Bounce Detection Schema Migrations.
+    Adds bounce_reason (TEXT) and bounced_at (TIMESTAMPTZ) to email_log
+    so that BounceDetectionService can record full DSN context.
+    delivery_status is NOT altered.
+    """
+    logger.info("Starting Phase 2A bounce detection schema migrations...")
+    async with AsyncSessionLocal() as session:
+        # 1. Add bounce_reason column (stores raw diagnostic / reason text)
+        try:
+            await session.execute(text("""
+                ALTER TABLE email_log
+                ADD COLUMN IF NOT EXISTS bounce_reason TEXT NULL
+            """))
+            await session.commit()
+            logger.info("Verified column: bounce_reason exists in email_log")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed to add bounce_reason to email_log", error=str(e))
+
+        # 2. Add bounced_at column (timestamp when the bounce DSN was processed)
+        try:
+            await session.execute(text("""
+                ALTER TABLE email_log
+                ADD COLUMN IF NOT EXISTS bounced_at TIMESTAMP WITH TIME ZONE NULL
+            """))
+            await session.commit()
+            logger.info("Verified column: bounced_at exists in email_log")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed to add bounced_at to email_log", error=str(e))
+
+        # 3. Performance index on bounce_status for filtering bounced emails
+        try:
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_email_log_bounce_status
+                ON email_log (bounce_status)
+                WHERE bounce_status IS NOT NULL
+            """))
+            await session.commit()
+            logger.info("Verified index: idx_email_log_bounce_status on email_log")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed to create idx_email_log_bounce_status", error=str(e))
+
+        # 4. Performance index on internet_message_id for O(1) bounce matching
+        try:
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_email_log_internet_message_id
+                ON email_log (internet_message_id)
+                WHERE internet_message_id IS NOT NULL
+            """))
+            await session.commit()
+            logger.info("Verified index: idx_email_log_internet_message_id on email_log")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed to create idx_email_log_internet_message_id", error=str(e))
+
+    logger.info("Phase 2A bounce detection schema migrations completed.")
+
+
+async def run_email_suppression_migrations():
+    """
+    Phase 2B migration: Creates the email_suppressions table and index
+    to store hard-bounced recipient email addresses associated with organizations.
+    Idempotent execution.
+    """
+    logger.info("Running Phase 2B email suppression schema migrations...")
+    async with AsyncSessionLocal() as session:
+        try:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS email_suppressions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    organization_id UUID NOT NULL REFERENCES organizations(id),
+                    email_address VARCHAR NOT NULL,
+                    reason VARCHAR NOT NULL DEFAULT 'hard_bounce',
+                    bounce_reason TEXT NULL,
+                    suppressed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                    CONSTRAINT uq_email_suppression_org_email UNIQUE (organization_id, email_address)
+                )
+            """))
+            await session.commit()
+            logger.info("Verified table: email_suppressions")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed to create table email_suppressions", error=str(e))
+
+        try:
+            await session.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_email_suppressions_lookup
+                ON email_suppressions (organization_id, lower(email_address))
+            """))
+            await session.commit()
+            logger.info("Verified index: idx_email_suppressions_lookup")
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed to create idx_email_suppressions_lookup", error=str(e))
+
+    logger.info("Phase 2B email suppression schema migrations completed.")
+
+
 if __name__ == "__main__":
     async def main():
         await run_engagement_migrations()
         await run_ai_reply_migrations()
         await run_organization_settings_migrations()
         await run_smtp_migrations()
+        await run_bounce_detection_migrations()
+        await run_email_suppression_migrations()
     asyncio.run(main())
+

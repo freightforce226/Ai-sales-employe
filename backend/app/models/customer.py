@@ -21,3 +21,25 @@ class Customer(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    # V2 optional columns
+    designation = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    website = Column(String, nullable=True)
+    linkedin = Column(String, nullable=True)
+    address = Column(String, nullable=True)
+    city = Column(String, nullable=True)
+    state = Column(String, nullable=True)
+    shipment_mode = Column(String, nullable=True)
+    trade_direction = Column(String, nullable=True)
+    customer_type = Column(String, nullable=True)
+    trade_region = Column(String, nullable=True)
+    goods_description = Column(String, nullable=True)
+    raw_company_name = Column(String, nullable=True)
+    raw_contact_name = Column(String, nullable=True)
+
+    # Email Validation columns
+    email_validation_status = Column(String, nullable=True, default="valid", index=True)
+    raw_contact_email = Column(String, nullable=True)
+    email_validation_error = Column(String, nullable=True)
+

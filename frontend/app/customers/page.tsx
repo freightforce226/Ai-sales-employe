@@ -43,6 +43,24 @@ interface Customer {
   last_email: string | null;
   imported_on: string;
   status: string;
+  is_suppressed?: boolean;
+  suppression_reason?: string | null;
+  bounce_reason?: string | null;
+  suppressed_at?: string | null;
+  designation?: string | null;
+  phone?: string | null;
+  website?: string | null;
+  linkedin?: string | null;
+  address?: string | null;
+  city?: string | null;
+  state?: string | null;
+  shipment_mode?: string | null;
+  trade_direction?: string | null;
+  customer_type?: string | null;
+  trade_region?: string | null;
+  goods_description?: string | null;
+  raw_company_name?: string | null;
+  raw_contact_name?: string | null;
 }
 
 interface TimelineEvent {
@@ -77,6 +95,35 @@ interface Stats {
   segment_breakdown: Record<string, number>;
   country_breakdown: Record<string, number>;
 }
+
+const isValidWebsite = (url: string | null | undefined): boolean => {
+  if (!url) return false;
+  const cleaned = url.trim().toLowerCase();
+  return cleaned !== '' && cleaned !== 'null' && cleaned !== 'n/a' && cleaned !== 'na' && cleaned !== '-';
+};
+
+const isValidLinkedin = (url: string | null | undefined): boolean => {
+  if (!url) return false;
+  const cleaned = url.trim().toLowerCase();
+  return (
+    cleaned !== '' &&
+    cleaned !== 'null' &&
+    cleaned !== 'n/a' &&
+    cleaned !== 'na' &&
+    cleaned !== '-' &&
+    (cleaned.includes('linkedin.com') || cleaned.startsWith('http'))
+  );
+};
+
+const cleanDisplayValue = (val: string | null | undefined): string => {
+  if (!val) return '—';
+  const cleaned = val.trim();
+  const lower = cleaned.toLowerCase();
+  if (lower === '' || lower === 'null' || lower === 'n/a' || lower === 'na' || cleaned === '-') {
+    return '—';
+  }
+  return cleaned;
+};
 
 const getEventIcon = (type: string) => {
   switch (type) {
@@ -202,6 +249,84 @@ export default function CustomersPage() {
     setTimeout(() => {
       setAlertInfo(null);
     }, 4000);
+  };
+  const [isCreatingCustomer, setIsCreatingCustomer] = useState(false);
+  const [createForm, setCreateForm] = useState({
+    company_name: '',
+    contact_name: '',
+    contact_email: '',
+    industry: '',
+    country: '',
+    designation: '',
+    phone: '',
+    website: '',
+    linkedin: '',
+    address: '',
+    city: '',
+    state: '',
+    shipment_mode: '',
+    trade_direction: '',
+    customer_type: '',
+    trade_region: '',
+    goods_description: ''
+  });
+  const [creatingLoading, setCreatingLoading] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [activeFormTab, setActiveFormTab] = useState<'basic' | 'professional' | 'logistics'>('basic');
+
+  const resetCreateForm = () => {
+    setCreateForm({
+      company_name: '',
+      contact_name: '',
+      contact_email: '',
+      industry: '',
+      country: '',
+      designation: '',
+      phone: '',
+      website: '',
+      linkedin: '',
+      address: '',
+      city: '',
+      state: '',
+      shipment_mode: '',
+      trade_direction: '',
+      customer_type: '',
+      trade_region: '',
+      goods_description: ''
+    });
+    setCreateError(null);
+    setActiveFormTab('basic');
+  };
+
+  const handleCreateCustomer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!createForm.company_name.trim()) {
+      setCreateError('Company Name is required.');
+      return;
+    }
+    try {
+      setCreatingLoading(true);
+      setCreateError(null);
+      
+      const payload: Record<string, any> = {};
+      Object.entries(createForm).forEach(([key, val]) => {
+        if (val && val.trim() !== '') {
+          payload[key] = val.trim();
+        }
+      });
+
+      const res = await api.post('/api/v1/customers', payload);
+      showToast('success', 'Customer Added', `Customer ${res.data.company_name} was created successfully.`);
+      setIsCreatingCustomer(false);
+      resetCreateForm();
+      fetchStats();
+      fetchCustomers();
+    } catch (err: any) {
+      console.error('Failed to create customer', err);
+      setCreateError(err.response?.data?.detail || 'Failed to add customer. Please verify input data.');
+    } finally {
+      setCreatingLoading(false);
+    }
   };
 
   // Load resources
@@ -399,7 +524,10 @@ export default function CustomersPage() {
     }
   };
 
-  const getStatusBadge = (status: string) => {
+  const getStatusBadge = (status: string, isSuppressed?: boolean) => {
+    if (isSuppressed || status === 'hard_bounce' || status === 'HARD_BOUNCE') {
+      return <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-[10px] font-bold bg-rose-500/10 text-rose-600 border border-rose-500/20 font-mono">🔴 HARD BOUNCE</span>;
+    }
     switch (status) {
       case 'ACTIVE':
         return <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-[10px] font-bold bg-emerald-500/10 text-emerald-600 border border-emerald-500/20">ACTIVE</span>;
@@ -443,7 +571,14 @@ export default function CustomersPage() {
               View, filter, and manage customer records integrated with CSV Import and Campaigns.
             </p>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 select-none">
+            <button
+              onClick={() => { resetCreateForm(); setIsCreatingCustomer(true); }}
+              className="h-10 px-5 bg-bg-surface border border-border-color hover:bg-bg-secondary text-text-primary rounded-lg text-sm font-semibold flex items-center gap-2 shadow-xs transition-all cursor-pointer"
+            >
+              <Users className="w-4 h-4 text-brand-primary" />
+              <span>Add Customer</span>
+            </button>
             <button
               onClick={() => setConfirmModalOpen(true)}
               className="h-10 px-5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold flex items-center gap-2 shadow-sm transition-all cursor-pointer border-0"
@@ -654,7 +789,7 @@ export default function CustomersPage() {
                       <td className="p-4">{getReadinessBadge(c.engagement_readiness)}</td>
                       <td className="p-4 text-xs text-text-muted font-mono">{c.last_email || '—'}</td>
                       <td className="p-4 text-xs text-text-muted font-mono">{c.imported_on}</td>
-                      <td className="p-4">{getStatusBadge(c.status)}</td>
+                      <td className="p-4">{getStatusBadge(c.status, c.is_suppressed)}</td>
                       <td className="p-4 text-right">
                         <div className="flex items-center justify-end space-x-1.5">
                           <button
@@ -843,6 +978,24 @@ export default function CustomersPage() {
                         </div>
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                          {selectedCustomer.is_suppressed && (
+                            <div className="col-span-1 sm:col-span-2 p-4 bg-rose-50 border border-rose-200 rounded-xl space-y-1.5">
+                              <div className="flex items-center space-x-2 text-rose-700 font-bold text-xs">
+                                <AlertCircle className="w-4 h-4 text-rose-600" />
+                                <span>🔴 Hard Bounce / Suppressed</span>
+                              </div>
+                              {selectedCustomer.bounce_reason && (
+                                <p className="text-xs text-rose-900 font-mono">
+                                  <span className="font-bold">Reason:</span> {selectedCustomer.bounce_reason}
+                                </p>
+                              )}
+                              {selectedCustomer.suppressed_at && (
+                                <p className="text-[11px] text-rose-700 font-mono">
+                                  <span className="font-bold">Suppressed:</span> {new Date(selectedCustomer.suppressed_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                                </p>
+                              )}
+                            </div>
+                          )}
                           {/* Company Name */}
                           <div className="space-y-1">
                             <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Company</label>
@@ -932,8 +1085,115 @@ export default function CustomersPage() {
                           <div className="space-y-1">
                             <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Segment</label>
                             <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40 uppercase">
-                              {selectedCustomer.segment || '—'}
+                              {cleanDisplayValue(selectedCustomer.segment)}
                             </p>
+                          </div>
+
+                          {/* Designation */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Designation</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
+                              {cleanDisplayValue(selectedCustomer.designation)}
+                            </p>
+                          </div>
+
+                          {/* Phone */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Phone</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
+                              {cleanDisplayValue(selectedCustomer.phone)}
+                            </p>
+                          </div>
+
+                          {/* Website */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Website</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
+                              {isValidWebsite(selectedCustomer.website) ? (
+                                <a 
+                                  href={selectedCustomer.website!.trim().startsWith('http') ? selectedCustomer.website!.trim() : `https://${selectedCustomer.website!.trim()}`} 
+                                  target="_blank" 
+                                  rel="noreferrer" 
+                                  className="text-brand-primary hover:underline"
+                                >
+                                  {selectedCustomer.website!.trim()}
+                                </a>
+                              ) : '—'}
+                            </p>
+                          </div>
+
+                          {/* LinkedIn */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">LinkedIn</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
+                              {isValidLinkedin(selectedCustomer.linkedin) ? (
+                                <a 
+                                  href={selectedCustomer.linkedin!.trim().startsWith('http') ? selectedCustomer.linkedin!.trim() : `https://${selectedCustomer.linkedin!.trim()}`} 
+                                  target="_blank" 
+                                  rel="noreferrer" 
+                                  className="text-brand-primary hover:underline"
+                                >
+                                  LinkedIn Profile
+                                </a>
+                              ) : '—'}
+                            </p>
+                          </div>
+
+                          {/* Address */}
+                          <div className="space-y-1 sm:col-span-2">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Full Address</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40">
+                              {cleanDisplayValue(selectedCustomer.address) === '—' ? '—' : (
+                                <>
+                                  {selectedCustomer.address}
+                                  {(isValidWebsite(selectedCustomer.city) || isValidWebsite(selectedCustomer.state)) && (
+                                    <span className="block text-text-secondary mt-1 font-medium">
+                                      {isValidWebsite(selectedCustomer.city) && `${selectedCustomer.city}, `}
+                                      {isValidWebsite(selectedCustomer.state) && `${selectedCustomer.state}`}
+                                    </span>
+                                  )}
+                                </>
+                              )}
+                            </p>
+                          </div>
+
+                          {/* Trade Region & Customer Type */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Trade Region / Market</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40 uppercase">
+                              {cleanDisplayValue(selectedCustomer.trade_region)}
+                            </p>
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Customer Type</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40 uppercase">
+                              {cleanDisplayValue(selectedCustomer.customer_type)}
+                            </p>
+                          </div>
+
+                          {/* Logistics Segment Details */}
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Shipment Mode</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40 uppercase">
+                              {cleanDisplayValue(selectedCustomer.shipment_mode)}
+                            </p>
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Trade Direction</label>
+                            <p className="text-xs font-semibold text-text-primary bg-bg-secondary p-2.5 rounded-lg border border-border-color/40 uppercase">
+                              {cleanDisplayValue(selectedCustomer.trade_direction)}
+                            </p>
+                          </div>
+
+                          {/* Raw Fields & Audit Logs */}
+                          <div className="space-y-1 sm:col-span-2">
+                            <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Original Information</label>
+                            <div className="text-xs font-medium text-text-secondary bg-bg-secondary p-3 rounded-lg border border-border-color/40 space-y-1.5 font-mono">
+                              <div><span className="font-bold text-text-muted text-[10px] uppercase mr-2">Original Company Name:</span> {cleanDisplayValue(selectedCustomer.raw_company_name)}</div>
+                              <div><span className="font-bold text-text-muted text-[10px] uppercase mr-2">Original Contact Details:</span> {cleanDisplayValue(selectedCustomer.raw_contact_name)}</div>
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -1062,7 +1322,7 @@ export default function CustomersPage() {
                                         
                                         {evt.attachments && evt.attachments.length > 0 && (
                                           <div className="pt-2 border-t border-border-color/30 flex items-center gap-1.5 flex-wrap">
-                                            {evt.attachments.map((attName, aIdx) => (
+                                            {evt.attachments.map((attName: string, aIdx: number) => (
                                               <div 
                                                 key={aIdx} 
                                                 onClick={(e) => e.stopPropagation()}
@@ -1180,6 +1440,292 @@ export default function CustomersPage() {
         isLoading={isBulkDeletingLoading}
         variant="destructive"
       />
+
+      {/* Add Customer Modal */}
+      {isCreatingCustomer && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/45 backdrop-blur-xs select-none">
+          <div className="bg-bg-surface border border-border-color rounded-2xl shadow-2xl w-full max-w-xl overflow-hidden flex flex-col animate-scale-up">
+            {/* Header */}
+            <div className="p-5 border-b border-border-color flex justify-between items-center bg-bg-surface">
+              <div>
+                <h3 className="text-sm font-bold text-text-primary uppercase tracking-wider">Add New Customer</h3>
+                <p className="text-[10px] text-text-muted mt-0.5">Manually create a new customer or lead profile record.</p>
+              </div>
+              <button
+                onClick={() => { setIsCreatingCustomer(false); resetCreateForm(); }}
+                disabled={creatingLoading}
+                className="p-1.5 text-text-secondary hover:text-text-primary hover:bg-bg-secondary rounded-lg transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Error Message */}
+            {createError && (
+              <div className="px-5 pt-4">
+                <div className="flex gap-2.5 p-3 rounded-lg border border-rose-100 bg-rose-50 text-xs font-semibold text-rose-600 leading-relaxed">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{createError}</span>
+                </div>
+              </div>
+            )}
+
+            {/* Tabs */}
+            <div className="px-5 pt-3 flex gap-2 border-b border-border-color/60 bg-bg-surface select-none">
+              <button
+                onClick={() => setActiveFormTab('basic')}
+                className={`pb-2 px-1 text-xs font-bold border-b-2 transition-all cursor-pointer ${
+                  activeFormTab === 'basic' 
+                    ? 'border-brand-primary text-brand-primary' 
+                    : 'border-transparent text-text-muted hover:text-text-primary'
+                }`}
+              >
+                Basic Information
+              </button>
+              <button
+                onClick={() => setActiveFormTab('professional')}
+                className={`pb-2 px-1 text-xs font-bold border-b-2 transition-all cursor-pointer ${
+                  activeFormTab === 'professional' 
+                    ? 'border-brand-primary text-brand-primary' 
+                    : 'border-transparent text-text-muted hover:text-text-primary'
+                }`}
+              >
+                Professional Info
+              </button>
+              <button
+                onClick={() => setActiveFormTab('logistics')}
+                className={`pb-2 px-1 text-xs font-bold border-b-2 transition-all cursor-pointer ${
+                  activeFormTab === 'logistics' 
+                    ? 'border-brand-primary text-brand-primary' 
+                    : 'border-transparent text-text-muted hover:text-text-primary'
+                }`}
+              >
+                Logistics Parameters
+              </button>
+            </div>
+
+            {/* Form Fields Body */}
+            <form onSubmit={handleCreateCustomer} className="flex-1 overflow-y-auto max-h-[50vh] p-5 space-y-4">
+              {activeFormTab === 'basic' && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="space-y-1 sm:col-span-2">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Company Name <span className="text-rose-500 font-bold">*</span></label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="E.g., Apex Logistics Ltd"
+                      value={createForm.company_name}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, company_name: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Contact Name</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., John Doe"
+                      value={createForm.contact_name}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, contact_name: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Contact Email</label>
+                    <input
+                      type="email"
+                      placeholder="E.g., john@apexlogistics.com"
+                      value={createForm.contact_email}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, contact_email: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Industry</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., Electronics, Textiles"
+                      value={createForm.industry}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, industry: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Country</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., China, Germany"
+                      value={createForm.country}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, country: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {activeFormTab === 'professional' && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Designation</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., Procurement Manager"
+                      value={createForm.designation}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, designation: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Phone</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., +919818299901"
+                      value={createForm.phone}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, phone: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Website</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., www.apexlogistics.com"
+                      value={createForm.website}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, website: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">LinkedIn URL</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., linkedin.com/company/apex"
+                      value={createForm.linkedin}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, linkedin: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {activeFormTab === 'logistics' && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="space-y-1 sm:col-span-2">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Street Address</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., 42 Business Hub Marg"
+                      value={createForm.address}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, address: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">City</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., New Delhi"
+                      value={createForm.city}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, city: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">State</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., Delhi"
+                      value={createForm.state}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, state: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Shipment Mode</label>
+                    <select
+                      value={createForm.shipment_mode}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, shipment_mode: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    >
+                      <option value="">Select Mode...</option>
+                      <option value="air">Air</option>
+                      <option value="sea">Sea</option>
+                      <option value="road">Road</option>
+                      <option value="rail">Rail</option>
+                      <option value="multi">Multi</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Trade Direction</label>
+                    <select
+                      value={createForm.trade_direction}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, trade_direction: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    >
+                      <option value="">Select Direction...</option>
+                      <option value="import">Import</option>
+                      <option value="export">Export</option>
+                      <option value="both">Both</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Customer Type</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., Manufacturer, Trader"
+                      value={createForm.customer_type}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, customer_type: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Goods Description</label>
+                    <input
+                      type="text"
+                      placeholder="E.g., Machinery, Auto Parts"
+                      value={createForm.goods_description}
+                      onChange={(e) => setCreateForm(prev => ({ ...prev, goods_description: e.target.value }))}
+                      className="w-full p-2 border border-border-color rounded-lg text-xs bg-bg-secondary focus:outline-none focus:ring-1 focus:ring-brand-primary font-semibold text-text-primary"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Action Buttons Footer */}
+              <div className="pt-4 border-t border-border-color flex justify-end gap-3 select-none">
+                <button
+                  type="button"
+                  onClick={() => { setIsCreatingCustomer(false); resetCreateForm(); }}
+                  disabled={creatingLoading}
+                  className="px-4 py-2 border border-border-color bg-bg-surface text-text-secondary hover:bg-bg-secondary text-xs font-semibold rounded-xl transition-all cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={creatingLoading}
+                  className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition-all shadow-xs flex items-center justify-center gap-1.5 cursor-pointer border-0"
+                >
+                  {creatingLoading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>Add Lead</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </AppShell>
   );
 }

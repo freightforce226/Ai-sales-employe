@@ -12,6 +12,18 @@ class MicrosoftGraphProvider(BaseEmailProvider):
         self.graph_client = MicrosoftGraphClient()
 
     async def _get_access_token(self, org_id: UUID, db_session: AsyncSession) -> str:
+        """
+        Returns a valid Microsoft Graph access token for the org.
+        If pre_resolved_token is available (set by EmailService during Transaction A),
+        it is returned directly without any database query.
+        """
+        if getattr(self, "pre_resolved_token", None):
+            return self.pre_resolved_token
+        if db_session is None:
+            raise Exception(
+                "Microsoft Graph token is not pre-resolved and no db_session was provided. "
+                "Ensure credentials are resolved during Transaction A."
+            )
         token_service = TokenService(db_session)
         return await token_service.get_valid_access_token(org_id)
 
@@ -47,7 +59,8 @@ class MicrosoftGraphProvider(BaseEmailProvider):
         bcc_emails: List[str],
         attachments: List[Dict[str, Any]],
         db_session: AsyncSession,
-        sender_display_name: Optional[str] = None
+        sender_display_name: Optional[str] = None,
+        subject: Optional[str] = None
     ) -> str:
         import asyncio
         import httpx

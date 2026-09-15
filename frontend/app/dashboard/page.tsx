@@ -195,7 +195,8 @@ export default function DashboardPage() {
   );
 
   const outreachEvents = activities.filter(act => 
-    ['csv_imported', 'email_sent', 'sequence_closed', 'sequence_finished', 'email_failed'].includes(act.event_type)
+    ['email_sent', 'ai_outreach_sent', 'sequence_closed', 'sequence_finished', 'email_failed'].includes(act.event_type) &&
+    !['reply_received', 'ai_reply_sent', 'human_reply_sent', 'csv_imported', 'customer_imported', 'customer_created'].includes(act.event_type)
   );
   const sortedOutreachEvents = [...outreachEvents].sort((a, b) => 
     new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()

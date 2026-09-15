@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import email, oauth, auth, dashboard, csv_import, customers, templates, attachments, engagement, follow_ups, ai_reply, smtp
+from app.api.routes import email, oauth, auth, dashboard, csv_import, customers, templates, attachments, engagement, follow_ups, ai_reply, smtp, marketing
 from app.core.config import get_settings
 from app.core.exceptions import (
     EmailSendError,
@@ -50,14 +50,18 @@ async def lifespan(app: FastAPI):
     )
     
     # Initialize DB schemas/tables if missing
-    from app.db.migrations import run_engagement_migrations, run_ai_reply_migrations, run_organization_settings_migrations, run_smtp_migrations
+    from app.db.migrations import run_engagement_migrations, run_ai_reply_migrations, run_organization_settings_migrations, run_smtp_migrations, run_marketing_migrations, run_bounce_detection_migrations, run_email_suppression_migrations
     from app.db.migrations_scheduled import run_scheduled_migrations
     try:
         await run_engagement_migrations()
         await run_ai_reply_migrations()
         await run_organization_settings_migrations()
         await run_smtp_migrations()
+        await run_marketing_migrations()
         await run_scheduled_migrations()
+        await run_bounce_detection_migrations()
+        await run_email_suppression_migrations()
+
         from sqlalchemy import text
         from app.db.session import AsyncSessionLocal
         async with AsyncSessionLocal() as session:
@@ -165,7 +169,10 @@ async def lifespan(app: FastAPI):
                     res = await session.execute(text("""
                         SELECT id, file_path 
                         FROM import_batches 
-                        WHERE status IN ('completed', 'failed') AND file_path IS NOT NULL AND file_path != ''
+                        WHERE status IN ('completed', 'failed') 
+                          AND file_path IS NOT NULL 
+                          AND file_path != ''
+                          AND COALESCE(completed_at, created_at) <= NOW() - INTERVAL '10 hours'
                     """))
                     rows = res.fetchall()
                     for row_id, file_path in rows:
@@ -180,7 +187,12 @@ async def lifespan(app: FastAPI):
                                     "Authorization": f"Bearer {settings.supabase_service_role_key}"
                                 }
                             )
-                            if del_res.status_code in (200, 204, 404):
+                            is_deleted_or_missing = (
+                                del_res.status_code in (200, 204, 404) or
+                                "not_found" in del_res.text.lower() or
+                                "nosuchkey" in del_res.text.lower()
+                            )
+                            if is_deleted_or_missing:
                                 await session.execute(text("""
                                     UPDATE import_batches 
                                     SET file_path = NULL 
@@ -427,6 +439,7 @@ app.include_router(follow_ups.router, prefix="/api/v1/followups")
 app.include_router(ai_reply.router)
 app.include_router(org_settings.router)
 app.include_router(smtp.router, prefix="/api/v1")
+app.include_router(marketing.router)
 from app.api.routes import debug
 app.include_router(debug.router)
 

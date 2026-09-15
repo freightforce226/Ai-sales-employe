@@ -4,11 +4,13 @@ import mimetypes
 import os
 import httpx
 import asyncio
+import uuid
 from typing import Optional
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from app.db.session import AsyncSessionLocal
 
 from app.providers import EmailProviderFactory, BaseEmailProvider
 from app.core.exceptions import EmailSendError, GraphApiError, TenantNotFoundError
@@ -37,16 +39,20 @@ def _clean_old_cache_entries():
         del _attachment_cache[k]
 
 
-async def _fetch_and_cache_attachment(storage_path: str, strict: bool, stats: dict) -> Optional[dict]:
+async def _fetch_and_cache_attachment(org_id: uuid.UUID, storage_path: str, strict: bool, stats: dict) -> Optional[dict]:
     from app.core.debug_logger import log_to_request_file
+    import uuid
     _clean_old_cache_entries()
 
+    # Partitioned key for tenant safety
+    cache_key = f"{org_id}:{storage_path}"
+
     # Check cache
-    if storage_path in _attachment_cache:
-        entry = _attachment_cache[storage_path]
+    if cache_key in _attachment_cache:
+        entry = _attachment_cache[cache_key]
         if time.time() - entry["cached_at"] <= CACHE_TTL_SECONDS:
-            logger.info("Attachment Cache HIT", storage_path=storage_path)
-            log_to_request_file(f"Attachment Cache HIT for storage_path: {storage_path}")
+            logger.info("Attachment Cache HIT", storage_path=storage_path, org_id=str(org_id))
+            log_to_request_file(f"Attachment Cache HIT for org_id: {org_id}, storage_path: {storage_path}")
             stats["hits"] += 1
             return {
                 "@odata.type": "#microsoft.graph.fileAttachment",
@@ -55,8 +61,8 @@ async def _fetch_and_cache_attachment(storage_path: str, strict: bool, stats: di
                 "contentBytes": entry["content_bytes"]
             }
 
-    logger.info("Attachment Cache MISS", storage_path=storage_path)
-    log_to_request_file(f"Attachment Cache MISS. Commencing download for storage_path: {storage_path}")
+    logger.info("Attachment Cache MISS", storage_path=storage_path, org_id=str(org_id))
+    log_to_request_file(f"Attachment Cache MISS. Commencing download for org_id: {org_id}, storage_path: {storage_path}")
     stats["misses"] += 1
     supabase_download_url = f"{settings.supabase_url}/storage/v1/object/authenticated/tenant-attachments/{storage_path}"
     log_to_request_file(f"Downloading from Supabase: {supabase_download_url}")
@@ -97,7 +103,7 @@ async def _fetch_and_cache_attachment(storage_path: str, strict: bool, stats: di
             log_to_request_file(f"Base64 encoding completed successfully. String length: {len(base64_str)} chars")
 
             # Store in cache
-            _attachment_cache[storage_path] = {
+            _attachment_cache[cache_key] = {
                 "content_bytes": base64_str,
                 "content_type": content_type,
                 "file_name": file_name,
@@ -112,7 +118,7 @@ async def _fetch_and_cache_attachment(storage_path: str, strict: bool, stats: di
                 "contentBytes": base64_str
             }
     except Exception as e:
-        logger.error("Failed to download attachment", storage_path=storage_path, error=str(e))
+        logger.error("Failed to download attachment", storage_path=storage_path, org_id=str(org_id), error=str(e))
         log_to_request_file(f"Failed to download or convert attachment from storage_path '{storage_path}'. Error: {str(e)}")
         if strict:
             raise EmailSendError(f"Attachment download failed for {storage_path}: {str(e)}")
@@ -124,6 +130,44 @@ class EmailService:
     def __init__(self, session: AsyncSession):
         self.session = session
         self.provider_factory = EmailProviderFactory(session)
+
+    @staticmethod
+    async def _is_email_suppressed(org_id, email_address: str, db: AsyncSession) -> bool:
+        """
+        Phase 2B — Check whether an email address has a confirmed hard-bounce suppression
+        record for this organisation.
+
+        Uses the composite index idx_email_suppressions_lookup(organization_id, lower(email_address))
+        for an O(1) lookup.  Returns True if the address is suppressed and no email should
+        be sent; False otherwise.
+
+        This check is intentionally lightweight: a single SELECT with LIMIT 1.  It uses a
+        fresh DB query (not a cache) so suppression records inserted by BounceDetectionService
+        are immediately honoured without a server restart.
+        """
+        try:
+            res = await db.execute(
+                text("""
+                    SELECT 1
+                    FROM email_suppressions
+                    WHERE organization_id = :org_id
+                      AND lower(email_address) = lower(:email)
+                    LIMIT 1
+                """),
+                {"org_id": org_id, "email": email_address},
+            )
+            return res.fetchone() is not None
+        except Exception as lookup_err:
+            # Safety: if the suppression table is unavailable, fail open (allow send)
+            # to avoid blocking legitimate email during an infrastructure incident.
+            logger.warning(
+                "Phase 2B: Suppression lookup failed; allowing send (fail-open)",
+                org_id=str(org_id),
+                email=email_address,
+                error=str(lookup_err),
+            )
+            return False
+
 
     async def _send_new_email(
         self,
@@ -138,6 +182,8 @@ class EmailService:
     ) -> str:
         from app.core.debug_logger import log_to_request_file
         log_to_request_file("Executing Scenario 2: Standard Outbound Email (sendMail)")
+        # NOTE: db_session=None forces provider to use pre_resolved_token/settings.
+        # Transaction A has already closed the session and resolved credentials.
         return await provider.send_email(
             org_id=request.organization_id,
             recipient=request.customer_email,
@@ -146,7 +192,7 @@ class EmailService:
             cc_emails=cc_emails,
             bcc_emails=bcc_emails,
             attachments=graph_attachments,
-            db_session=self.session,
+            db_session=None,
             sender_display_name=sender_display_name
         )
 
@@ -164,6 +210,8 @@ class EmailService:
     ) -> str:
         from app.core.debug_logger import log_to_request_file
         log_to_request_file(f"Executing Scenario 1: Threaded Reply on parent message ID {parent_message_id}")
+        # NOTE: db_session=None forces provider to use pre_resolved_token/settings.
+        # Transaction A has already closed the session and resolved credentials.
         return await provider.send_reply(
             org_id=request.organization_id,
             parent_message_id=parent_message_id,
@@ -171,8 +219,9 @@ class EmailService:
             cc_emails=cc_emails,
             bcc_emails=bcc_emails,
             attachments=graph_attachments,
-            db_session=self.session,
-            sender_display_name=sender_display_name
+            db_session=None,
+            sender_display_name=sender_display_name,
+            subject=request.subject
         )
 
     async def send_tenant_email(self, request: EmailRequest) -> EmailResponse:
@@ -200,8 +249,58 @@ class EmailService:
         embedding_generation_started = False
         campaign_enrollment_update_completed = False
 
+        # Resolve customer_email if missing or empty
+        if not request.customer_email and request.customer_id:
+            cust_res = await self.session.execute(
+                text("SELECT contact_email FROM customers WHERE id = :cid AND organization_id = :oid"),
+                {"cid": request.customer_id, "oid": request.organization_id}
+            )
+            cust_row = cust_res.fetchone()
+            if cust_row and cust_row[0]:
+                request.customer_email = cust_row[0]
+                logger.info("Resolved customer_email from customer_id", customer_id=str(request.customer_id), email=request.customer_email)
+
         recipient = request.customer_email
         subject = request.subject
+
+        # ─────────────────────────────────────────────────────────────────────
+        # PHASE 2B — HARD-BOUNCE SUPPRESSION GUARD
+        # This runs before Transaction A, before any SMTP call, before any
+        # attachment download, and before any expensive metadata reads.
+        # If the recipient is suppressed the method returns immediately with
+        # skipped=True.  The caller (campaign / follow-up engine) must treat
+        # this as an intentional, non-retryable skip — NOT as a send failure.
+        # ─────────────────────────────────────────────────────────────────────
+        if recipient:
+            suppressed = await EmailService._is_email_suppressed(
+                org_id=request.organization_id,
+                email_address=recipient,
+                db=self.session,
+            )
+            if suppressed:
+                log_msg = (
+                    f"[Phase 2B] Hard-bounce suppression: skipping send to '{recipient}' "
+                    f"for org {request.organization_id}. No SMTP call will be made."
+                )
+                logger.warning(log_msg)
+                log_to_request_file(log_msg)
+                await self.session.close()
+                return EmailResponse(
+                    success=True,
+                    skipped=True,
+                    skip_reason="hard_bounce_suppressed",
+                    message_id=None,
+                    sent_at=None,
+                )
+
+        if request.parent_message_id or request.in_reply_to or request.references:
+            import re
+            clean_sub = re.sub(r'^(?:(re|fwd|reply):\s*)+', '', subject, flags=re.I).strip()
+            request.subject = f"Re: {clean_sub}"
+            subject = request.subject
+
+
+
 
         class StepTracker:
             def __init__(self, num: int, name: str):
@@ -312,14 +411,28 @@ class EmailService:
         async with StepTracker(1, "Request received"):
             pass
 
-        # STEP 2: Customer lookup
-        logger.info("SELECT customer")
-        log_to_request_file("Executing: SELECT customer")
+        # ==========================================
+        # TRANSACTION A: READ METADATA & LOCKS
+        # ==========================================
+        customer_id = None
         contact_name = "Team"
+        company_name = "your company"
+        mailbox_email = "N/A"
+        org_cc = []
+        org_bcc = []
+        sender_display_name = None
+        legacy_cc_list = []
+        parent_graph_message_id = None
+        is_reply_expected = False
+        resolved_attachments_meta = []
+        provider_type = "microsoft" # default
+        sig_config = None
+
         try:
+            # 1. Customer lookup
             async with StepTracker(2, "Customer lookup"):
                 cust_res = await self.session.execute(
-                    text("SELECT id, contact_name FROM customers WHERE contact_email = :email AND organization_id = :org_id"),
+                    text("SELECT id, contact_name, company_name FROM customers WHERE contact_email = :email AND organization_id = :org_id"),
                     {"email": request.customer_email, "org_id": request.organization_id}
                 )
                 cust_row = cust_res.fetchone()
@@ -328,20 +441,40 @@ class EmailService:
                 customer_id = str(cust_row[0])
                 if cust_row[1]:
                     contact_name = str(cust_row[1])
-                log_to_request_file(f"Customer lookup result: ID={customer_id}, contact_name={contact_name}")
-        except Exception as e:
-            handle_diagnostic_failure("Customer lookup", e, locals())
-            await self.session.rollback()
-            raise e
+                company_name = str(cust_row[2]) if cust_row[2] else "your company"
+                log_to_request_file(f"Customer lookup result: ID={customer_id}, contact_name={contact_name}, company_name={company_name}")
 
-        # STEP 3: Mailbox lookup
-        logger.info("SELECT tenant_integrations")
-        log_to_request_file("Executing: SELECT tenant_integrations")
-        mailbox_email = "N/A"
-        try:
+                # Perform campaign email personalization (support canonical {{contact_name}} and legacy {contact_name})
+                resolved_contact_name = contact_name
+                if not resolved_contact_name or resolved_contact_name.strip().lower() in ["", "team", "unknown contact", "valued customer", "unknown"]:
+                    resolved_contact_name = "there"
+
+                if request.subject:
+                    request.subject = request.subject.replace("{{contact_name}}", resolved_contact_name).replace("{contact_name}", resolved_contact_name)
+                    request.subject = request.subject.replace("{{customer_company_name}}", company_name).replace("{customer_company_name}", company_name)
+                if request.html_body:
+                    request.html_body = request.html_body.replace("{{contact_name}}", resolved_contact_name).replace("{contact_name}", resolved_contact_name)
+                    request.html_body = request.html_body.replace("{{customer_company_name}}", company_name).replace("{customer_company_name}", company_name)
+
+            # 2. Idempotency Check (Local DB)
+            if request.marketing_campaign_id and customer_id:
+                dup_res = await self.session.execute(
+                    text("SELECT id FROM email_log WHERE marketing_campaign_id = :camp_id AND customer_id = :cust_id LIMIT 1"),
+                    {"camp_id": request.marketing_campaign_id, "cust_id": customer_id}
+                )
+                if dup_res.fetchone():
+                    logger.warning("Idempotency Blocked: Email already sent to customer for this campaign", campaign_id=str(request.marketing_campaign_id), customer_id=customer_id)
+                    await self.session.close()
+                    return EmailResponse(
+                        success=True,
+                        message_id="IDEMPOTENT_SKIP",
+                        sent_at=datetime.now(timezone.utc).isoformat()
+                    )
+
+            # 3. Mailbox lookup
             async with StepTracker(3, "Mailbox lookup"):
-                now = time.time()
                 org_id_str = str(request.organization_id)
+                now = time.time()
                 if org_id_str in _tenant_mailbox_cache and now - _tenant_mailbox_cache[org_id_str]["cached_at"] <= CACHE_TTL_SECONDS:
                     mailbox_email = _tenant_mailbox_cache[org_id_str]["data"]
                 else:
@@ -354,186 +487,69 @@ class EmailService:
                         mailbox_email = row[0]
                     _tenant_mailbox_cache[org_id_str] = {"data": mailbox_email, "cached_at": now}
                 log_to_request_file(f"Mailbox lookup result: mailbox_email={mailbox_email}")
-        except Exception as e:
-            handle_diagnostic_failure("Mailbox lookup", e, locals())
-            await self.session.rollback()
-            raise e
 
-        # STEP 4: Download attachment
-        graph_attachments = []
-        log_to_request_file(f"Attachment Lifecycle Stage 3 - Email request object count: {len(request.attachments)} | Metadata: {request.attachments}")
-        try:
-            async with StepTracker(4, "Download attachment"):
-                if request.attachments:
-                    stats = {"hits": 0, "misses": 0, "total_bytes": 0}
-                    tasks = []
-                    for att in request.attachments:
-                        storage_path = att.storage_path
-                        if not storage_path and att.id:
-                            res_att = await self.session.execute(
-                                text("SELECT file_path FROM follow_up_attachment_files WHERE id = :id"),
-                                {"id": att.id}
-                            )
-                            row_att = res_att.fetchone()
-                            if row_att:
-                                storage_path = row_att[0]
-                        
-                        if storage_path:
-                            tasks.append(
-                                _fetch_and_cache_attachment(
-                                    storage_path,
-                                    request.strict_attachment_mode,
-                                    stats
-                                )
-                            )
-                        elif request.strict_attachment_mode:
-                            raise EmailSendError(f"Attachment storage path could not be resolved for ID: {att.id}")
-                    
-                    if tasks:
-                        results = await asyncio.gather(*tasks)
-                        graph_attachments = [r for r in results if r is not None]
-                attachment_insert_completed = True
-                log_to_request_file(f"Attachment download result: {len(graph_attachments)} attachments downloaded.")
-        except Exception as e:
-            handle_diagnostic_failure("Download attachment", e, locals())
-            await self.session.rollback()
-            raise e
+            # 4. Resolve provider type
+            prov_res = await self.session.execute(
+                text("SELECT provider FROM tenant_integrations WHERE organization_id = :org_id"),
+                {"org_id": request.organization_id}
+            )
+            prov_row = prov_res.fetchone()
+            if prov_row:
+                provider_type = prov_row[0]
 
-        # Resolve email provider dynamically via factory
-        try:
-            factory = EmailProviderFactory(self.session)
-            provider = await factory.get_provider_for_tenant(request.organization_id)
-        except Exception as e:
-            handle_diagnostic_failure("Provider Factory Resolution", e, locals())
-            await self.session.rollback()
-            raise e
+            # 5. CC/BCC Organization Settings
+            org_settings_res = await self.session.execute(text("""
+                SELECT cc_emails, bcc_emails, sender_display_name FROM organization_settings WHERE organization_id = :org_id
+            """), {"org_id": request.organization_id})
+            org_settings_row = org_settings_res.fetchone()
+            if org_settings_row:
+                org_cc = org_settings_row[0] or []
+                org_bcc = org_settings_row[1] or []
+                sender_display_name = org_settings_row[2]
 
-        # Load Signature Settings
-        try:
-            org_id_str = str(request.organization_id)
-            now = time.time()
-            if org_id_str in _signature_cache and now - _signature_cache[org_id_str]["cached_at"] <= CACHE_TTL_SECONDS:
-                sig_config = _signature_cache[org_id_str]["data"]
-            else:
-                sig_config = await branding_service.get_signature(request.organization_id)
-                _signature_cache[org_id_str] = {"data": sig_config, "cached_at": now}
-        except Exception as e:
-            handle_diagnostic_failure("Signature Settings Load", e, locals())
-            await self.session.rollback()
-            raise e
-
-        # STEP 5: Render HTML and Plain Text
-        try:
-            async with StepTracker(5, "Render HTML and Plain Text"):
-                has_sep = "--" in request.html_body
-                has_reg = "best regards" in request.html_body.lower() or "regards" in request.html_body.lower()
-                has_sig = (sig_config.signature_html.lower() in request.html_body.lower()) if sig_config and sig_config.signature_html else False
-                logger.info(
-                    "Stage: Email Payload Builder (Before Rendering)",
-                    reply_id=str(request.parent_message_id or "N/A"),
-                    reply_body_length=len(request.html_body),
-                    contains_separator=has_sep,
-                    contains_best_regards=has_reg,
-                    contains_org_signature=has_sig
-                )
-
-                cleaned_body = branding_service.clean_and_format_body(request.html_body)
-                
-                final_html_body = branding_service.render_html_email(
-                    body_content=cleaned_body,
-                    signature_html=sig_config.signature_html if sig_config else None,
-                    banner_url=sig_config.footer_image_url if sig_config else None
-                )
-                
-                # Check if footer image exists and append it as an inline attachment
-                if sig_config and sig_config.footer_image_path:
-                    try:
-                        img_att = await _fetch_and_cache_attachment(
-                            sig_config.footer_image_path,
-                            strict=False,
-                            stats={"hits": 0, "misses": 0, "total_bytes": 0}
-                        )
-                        if img_att:
-                            img_att["isInline"] = True
-                            img_att["contentId"] = "signature_image"
-                            graph_attachments.append(img_att)
-                            final_html_body = final_html_body.replace(sig_config.footer_image_url, "cid:signature_image")
-                    except Exception as img_err:
-                        logger.warning("Failed to fetch signature footer image for inline attachment", error=str(img_err))
-                
-                final_plain_body = branding_service.render_plain_email(final_html_body)
-
-                has_sep_html = "--" in final_html_body
-                has_reg_html = "best regards" in final_html_body.lower() or "regards" in final_html_body.lower()
-                has_sig_html = (sig_config.signature_html.lower() in final_html_body.lower()) if sig_config and sig_config.signature_html else False
-                logger.info(
-                    "Stage: Email Payload Builder (After Rendering HTML)",
-                    reply_id=str(request.parent_message_id or "N/A"),
-                    reply_body_length=len(final_html_body),
-                    contains_separator=has_sep_html,
-                    contains_best_regards=has_reg_html,
-                    contains_org_signature=has_sig_html
-                )
-
-                has_sep_plain = "--" in final_plain_body
-                has_reg_plain = "best regards" in final_plain_body.lower() or "regards" in final_plain_body.lower()
-                has_sig_plain = (sig_config.signature_html.lower() in final_plain_body.lower()) if sig_config and sig_config.signature_html else False
-                logger.info(
-                    "Stage: Email Payload Builder (After Rendering Plain Text)",
-                    reply_id=str(request.parent_message_id or "N/A"),
-                    reply_body_length=len(final_plain_body),
-                    contains_separator=has_sep_plain,
-                    contains_best_regards=has_reg_plain,
-                    contains_org_signature=has_sig_plain
-                )
-
-                logger.info("FINAL HTML Email Body to be sent", body_length=len(final_html_body))
-                logger.info("FINAL Plain Text Email Body to be sent", body_length=len(final_plain_body))
-
-                _payload = {
-                    "message": {
-                        "subject": request.subject,
-                        "body": {
-                            "contentType": "HTML",
-                            "content": final_html_body
-                        },
-                        "toRecipients": [
-                            {
-                                "emailAddress": {
-                                    "address": request.customer_email
-                                }
-                            }
-                        ]
-                    },
-                    "saveToSentItems": True
-                }
-                if graph_attachments:
-                    _payload["message"]["attachments"] = graph_attachments
+            # 6. Legacy CC Settings
+            settings_res = await self.session.execute(text("""
+                SELECT default_cc_emails FROM organization_ai_settings WHERE organization_id = :org_id
+            """), {"org_id": request.organization_id})
+            settings_row = settings_res.fetchone()
+            if settings_row and settings_row[0]:
                 import json
-                log_to_request_file(f"Attachment Lifecycle Stage 6 - Final Graph payload immediately before sendMail(): attachments count = {len(graph_attachments)} | filenames = {[a.get('name') for a in graph_attachments if a]}")
-                log_to_request_file(f"Graph API payload compiled:\n{json.dumps(_payload, indent=2)}")
-        except Exception as e:
-            handle_diagnostic_failure("HTML rendering", e, locals())
-            await self.session.rollback()
-            raise e
+                legacy_cc_list = json.loads(settings_row[0]) if isinstance(settings_row[0], str) else settings_row[0]
 
-        # Resolve parent Graph message ID for threaded reply
-        parent_graph_message_id = None
-        is_reply_expected = False
-
-        try:
+            # 7. Parent reply resolution
             if request.parent_message_id:
                 parent_graph_message_id = request.parent_message_id
                 is_reply_expected = True
-                log_to_request_file(f"Priority 1: Using parent_message_id directly from request: {parent_graph_message_id}")
+                
+                # Fetch parent details to populate references and in_reply_to (supports both inbound and outbound parents)
+                res_headers = await self.session.execute(text("""
+                    SELECT internet_message_id, "references"
+                    FROM email_log
+                    WHERE (graph_message_id = :p_id OR id::text = :p_id)
+                      AND organization_id = :org_id
+                    LIMIT 1
+                """), {
+                    "p_id": parent_graph_message_id,
+                    "org_id": request.organization_id
+                })
+                row_headers = res_headers.fetchone()
+                if row_headers:
+                    parent_internet_id, parent_refs = row_headers
+                    if parent_internet_id:
+                        if not request.in_reply_to:
+                            request.in_reply_to = parent_internet_id
+                        if not request.references:
+                            refs_list = []
+                            if parent_refs:
+                                refs_list = parent_refs.split()
+                            refs_list.append(parent_internet_id)
+                            request.references = " ".join(refs_list)
             elif request.references or request.in_reply_to:
                 is_reply_expected = True
-                log_to_request_file("Priority 2: Request is expected to be a threaded reply. Attempting DB lookup...")
                 res_parent = await self.session.execute(text("""
                     SELECT graph_message_id 
                     FROM email_log 
                     WHERE organization_id = :org_id 
-                      AND direction = 'inbound' 
                       AND (thread_id = :thread_id OR internet_message_id = :references OR internet_message_id = :in_reply_to)
                       AND graph_message_id IS NOT NULL
                     ORDER BY sent_at DESC 
@@ -547,71 +563,231 @@ class EmailService:
                 row_parent = res_parent.fetchone()
                 if row_parent:
                     parent_graph_message_id = row_parent[0]
-                    log_to_request_file(f"Resolved parent Graph message ID from DB lookup: {parent_graph_message_id}")
-                else:
-                    log_to_request_file("DB lookup returned no matching parent inbound email.")
-            else:
-                log_to_request_file("Priority 3: Brand-new outbound message. Proceeding straight to sendMail flow.")
+                    # Fetch details to populate references and in_reply_to if missing
+                    res_headers = await self.session.execute(text("""
+                        SELECT internet_message_id, "references"
+                        FROM email_log
+                        WHERE graph_message_id = :p_id
+                          AND organization_id = :org_id
+                        LIMIT 1
+                    """), {
+                        "p_id": parent_graph_message_id,
+                        "org_id": request.organization_id
+                    })
+                    row_headers = res_headers.fetchone()
+                    if row_headers:
+                        parent_internet_id, parent_refs = row_headers
+                        if parent_internet_id:
+                            if not request.in_reply_to:
+                                request.in_reply_to = parent_internet_id
+                            if not request.references:
+                                refs_list = []
+                                if parent_refs:
+                                    refs_list = parent_refs.split()
+                                refs_list.append(parent_internet_id)
+                                request.references = " ".join(refs_list)
+            elif getattr(request, "marketing_campaign_id", None) is None and customer_id:
+                # Controlled fallback for follow-up sends arriving without parent metadata:
+                # Look up the customer's most recent outbound engagement or follow-up email for this tenant
+                res_outbound_parent = await self.session.execute(text("""
+                    SELECT graph_message_id, internet_message_id, "references"
+                    FROM email_log
+                    WHERE organization_id = :org_id
+                      AND customer_id = :cust_id
+                      AND direction = 'outbound'
+                      AND marketing_campaign_id IS NULL
+                      AND graph_message_id IS NOT NULL
+                    ORDER BY sent_at DESC
+                    LIMIT 1
+                """), {
+                    "org_id": request.organization_id,
+                    "cust_id": customer_id
+                })
+                row_out = res_outbound_parent.fetchone()
+                if row_out:
+                    parent_graph_message_id = row_out[0]
+                    parent_internet_id, parent_refs = row_out[1], row_out[2]
+                    is_reply_expected = True
+                    if parent_internet_id:
+                        if not request.in_reply_to:
+                            request.in_reply_to = parent_internet_id
+                        if not request.references:
+                            refs_list = []
+                            if parent_refs:
+                                refs_list = parent_refs.split()
+                            refs_list.append(parent_internet_id)
+                            request.references = " ".join(refs_list)
+                    logger.info("Auto-resolved parent email for follow-up send", parent_graph_id=parent_graph_message_id, in_reply_to=request.in_reply_to)
+
+
+            # 8. Attachment storage path resolution
+            if request.attachments:
+                for att in request.attachments:
+                    storage_path = att.storage_path
+                    if not storage_path and att.id:
+                        res_att = await self.session.execute(
+                            text("SELECT file_path FROM follow_up_attachment_files WHERE id = :id"),
+                            {"id": att.id}
+                        )
+                        row_att = res_att.fetchone()
+                        if row_att:
+                            storage_path = row_att[0]
+                    resolved_attachments_meta.append({
+                        "id": att.id,
+                        "storage_path": storage_path,
+                        "filename": att.filename
+                    })
+
+            # 9. Get branding signatures
+            sig_config = await branding_service.get_signature(request.organization_id)
+
+            # 10. Pre-resolve provider credentials/settings in Transaction A
+            access_token = None
+            smtp_settings = None
+            if provider_type == "microsoft":
+                from app.services.token_service import TokenService
+                token_service = TokenService(self.session)
+                access_token = await token_service.get_valid_access_token(request.organization_id)
+                log_to_request_file("Successfully pre-resolved Microsoft Graph OAuth token.")
+            elif provider_type == "smtp":
+                from app.core.encryption import decrypt_token
+                smtp_res = await self.session.execute(
+                    text("""
+                        SELECT mailbox_email, auth_username, encrypted_password, 
+                               smtp_host, smtp_port, smtp_security 
+                        FROM tenant_integrations 
+                        WHERE organization_id = :org_id
+                    """),
+                    {"org_id": request.organization_id}
+                )
+                smtp_row = smtp_res.fetchone()
+                if not smtp_row:
+                    raise EmailSendError("No SMTP integration settings found for organization.")
+                
+                mailbox_email_smtp, auth_username, encrypted_password, smtp_host, smtp_port, smtp_security = smtp_row
+                if not smtp_host or not smtp_port or not encrypted_password:
+                    raise EmailSendError("SMTP connection settings are incomplete.")
+                
+                password = decrypt_token(encrypted_password)
+                username = auth_username if auth_username else mailbox_email_smtp
+                
+                smtp_settings = {
+                    "mailbox_email": mailbox_email_smtp,
+                    "username": username,
+                    "password": password,
+                    "host": smtp_host,
+                    "port": smtp_port,
+                    "security": smtp_security
+                }
+                log_to_request_file("Successfully pre-resolved SMTP server connection settings.")
+
+            # ==========================================
+            # COMMIT & RELEASE CONNECTION FOR TRANSACTION A
+            # ==========================================
+            await self.session.commit()
+            await self.session.close()
+            log_to_request_file("DB Connection Audit: Transaction A successfully committed & session connection released to pool.")
+
         except Exception as e:
-            handle_diagnostic_failure("Parent Message Resolution", e, locals())
+            handle_diagnostic_failure("Transaction A reads", e, locals())
             await self.session.rollback()
+            await self.session.close()
             raise e
 
-        # Load default CC/BCC/Sender Display Name from organization settings table
-        org_cc = []
-        org_bcc = []
-        sender_display_name = None
-        try:
-            org_id_str = str(request.organization_id)
-            now = time.time()
-            if org_id_str in _org_settings_cache and now - _org_settings_cache[org_id_str]["cached_at"] <= CACHE_TTL_SECONDS:
-                cached_settings = _org_settings_cache[org_id_str]["data"]
-                org_cc = cached_settings["cc"]
-                org_bcc = cached_settings["bcc"]
-                sender_display_name = cached_settings["sender_display_name"]
-            else:
-                org_settings_res = await self.session.execute(text("""
-                    SELECT cc_emails, bcc_emails, sender_display_name FROM organization_settings WHERE organization_id = :org_id
-                """), {"org_id": request.organization_id})
-                org_settings_row = org_settings_res.fetchone()
-                if org_settings_row:
-                    org_cc = org_settings_row[0] or []
-                    org_bcc = org_settings_row[1] or []
-                    sender_display_name = org_settings_row[2]
-                _org_settings_cache[org_id_str] = {
-                    "data": {"cc": org_cc, "bcc": org_bcc, "sender_display_name": sender_display_name},
-                    "cached_at": now
-                }
-        except Exception as org_settings_ex:
-            logger.warning("Failed to load CC/BCC/Sender Display Name from organization settings", error=str(org_settings_ex))
-
-        primary_to = request.customer_email.strip().lower()
-
-        # Build CC list
-        raw_cc_list = list(request.cc_emails or [])
+        # ==========================================
+        # EXTERNAL NETWORK OPERATIONS (No DB connection held)
+        # ==========================================
         
-        # Load legacy default CC for backward compatibility on replies
-        legacy_cc_list = []
+        # 1. Download attachments from Supabase storage
+        graph_attachments = []
         try:
-            org_id_str = str(request.organization_id)
-            now = time.time()
-            if org_id_str in _org_ai_settings_cache and now - _org_ai_settings_cache[org_id_str]["cached_at"] <= CACHE_TTL_SECONDS:
-                legacy_cc_list = _org_ai_settings_cache[org_id_str]["data"]
-            else:
-                settings_res = await self.session.execute(text("""
-                    SELECT default_cc_emails FROM organization_ai_settings WHERE organization_id = :org_id
-                """), {"org_id": request.organization_id})
-                settings_row = settings_res.fetchone()
-                if settings_row and settings_row[0]:
-                    import json
-                    legacy_cc_list = json.loads(settings_row[0]) if isinstance(settings_row[0], str) else settings_row[0]
-                _org_ai_settings_cache[org_id_str] = {"data": legacy_cc_list, "cached_at": now}
-        except Exception as settings_ex:
-            logger.warning("Failed to load default CC emails from AI settings", error=str(settings_ex))
+            async with StepTracker(4, "Download attachment"):
+                if resolved_attachments_meta:
+                    stats = {"hits": 0, "misses": 0, "total_bytes": 0}
+                    tasks = []
+                    for att_meta in resolved_attachments_meta:
+                        sp = att_meta["storage_path"]
+                        if sp:
+                            tasks.append(
+                                _fetch_and_cache_attachment(
+                                    request.organization_id,
+                                    sp,
+                                    request.strict_attachment_mode,
+                                    stats
+                                )
+                            )
+                        elif request.strict_attachment_mode:
+                            raise EmailSendError(f"Attachment storage path could not be resolved for ID: {att_meta['id']}")
+                    
+                    if tasks:
+                        results = await asyncio.gather(*tasks)
+                        graph_attachments = [r for r in results if r is not None]
+                attachment_insert_completed = True
+        except Exception as e:
+            handle_diagnostic_failure("Download attachment", e, locals())
+            raise e
 
+        # Instantiate provider factory with a temporary scoped session
+        provider = None
+        try:
+            async with AsyncSessionLocal() as factory_session:
+                factory = EmailProviderFactory(factory_session)
+                provider = await factory.get_provider_for_tenant(request.organization_id)
+                # Sever DB session reference to prevent pool checkout/leaks during slow provider network requests
+                provider.db_session = None
+                if hasattr(provider, "db"):
+                    provider.db = None
+            
+            # Attach pre-resolved credentials/settings to the provider instance
+            if provider_type == "microsoft" and access_token:
+                provider.pre_resolved_token = access_token
+            elif provider_type == "smtp" and smtp_settings:
+                provider.pre_resolved_settings = smtp_settings
+            log_to_request_file("DB Connection Audit: Pre-resolved credentials successfully attached to the email provider.")
+        except Exception as e:
+            handle_diagnostic_failure("Provider Resolution", e, locals())
+            raise e
+
+        # 2. Render HTML & Plain Text
+        try:
+            async with StepTracker(5, "Render HTML and Plain Text"):
+                cleaned_body = branding_service.clean_and_format_body(request.html_body)
+                
+                final_html_body = branding_service.render_html_email(
+                    body_content=cleaned_body,
+                    signature_html=sig_config.signature_html if sig_config else None,
+                    banner_url=sig_config.footer_image_url if sig_config else None
+                )
+                
+                # Check if footer image exists and append it as inline attachment
+                if sig_config and sig_config.footer_image_path and sig_config.footer_image_url:
+                    try:
+                        img_att = await _fetch_and_cache_attachment(
+                            request.organization_id,
+                            sig_config.footer_image_path,
+                            strict=False,
+                            stats={"hits": 0, "misses": 0, "total_bytes": 0}
+                        )
+                        if img_att:
+                            img_att["isInline"] = True
+                            img_att["contentId"] = "signature_image"
+                            graph_attachments.append(img_att)
+                            # Perform exact replacement of signed URL with cid:signature_image (idempotent, only if signed URL is present)
+                            if sig_config.footer_image_url in final_html_body:
+                                final_html_body = final_html_body.replace(sig_config.footer_image_url, "cid:signature_image")
+                    except Exception as img_err:
+                        logger.warning("Failed to fetch signature footer image for inline attachment", error=str(img_err))
+                
+                final_plain_body = branding_service.render_plain_email(final_html_body)
+        except Exception as e:
+            handle_diagnostic_failure("HTML rendering", e, locals())
+            raise e
+
+        # CC and BCC lists compilation
+        primary_to = request.customer_email.strip().lower()
+        raw_cc_list = list(request.cc_emails or [])
         if is_reply_expected:
             raw_cc_list.extend(legacy_cc_list)
-
         raw_cc_list.extend(org_cc)
 
         merged_cc = []
@@ -624,7 +800,6 @@ class EmailService:
                     merged_cc.append(clean_cc)
                     seen_cc.add(clean_cc_lower)
 
-        # Build BCC list
         raw_bcc_list = list(request.bcc_emails or [])
         raw_bcc_list.extend(org_bcc)
 
@@ -640,7 +815,66 @@ class EmailService:
                     merged_bcc.append(clean_bcc)
                     seen_bcc.add(clean_bcc_lower)
 
-        # STEP 6: Send Email
+        # 3. Provider Check (Idempotency against MS Graph)
+        # Prior to sending, check if Outlook Sent Items already holds this message to protect crash recovery path
+        # NOTE: db_session=None forces provider to use pre_resolved_token/settings (no DB connection held).
+        try:
+            sent_meta_pre = await provider.get_sent_metadata(
+                org_id=request.organization_id,
+                subject=request.subject,
+                to_email=request.customer_email,
+                db_session=None
+            )
+            if sent_meta_pre.get("retrieval_success"):
+                logger.warning("Microsoft Graph Sent Items HIT: Outbound mail was already successfully accepted.", customer=request.customer_email, subject=request.subject)
+                # Retroactively write email log inside Transaction B
+                async with AsyncSessionLocal() as write_db:
+                    email_log_id = uuid.uuid4()
+                    has_attachment = len(request.attachments) > 0 if request.attachments else False
+                    email_type_val = "campaign" if getattr(request, "marketing_campaign_id", None) else "engagement"
+                    
+                    await write_db.execute(
+                        text("""
+                            INSERT INTO email_log (
+                                id, organization_id, customer_id, campaign_id, marketing_campaign_id, direction, 
+                                email_type, subject, body, has_attachment, sent_at, delivery_status, graph_message_id,
+                                conversation_id, thread_id, internet_message_id, "references", in_reply_to, created_at
+                            ) VALUES (
+                                :id, :org_id, :customer_id, :campaign_id, :mkt_campaign_id, 'outbound', 
+                                CAST(:email_type AS public.email_type), :subject, :body, :has_attachment, NOW(), 'sent', :graph_message_id,
+                                :conversation_id, :thread_id, :internet_message_id, :references, :in_reply_to, NOW()
+                            ) ON CONFLICT (marketing_campaign_id, customer_id) WHERE marketing_campaign_id IS NOT NULL DO NOTHING
+                        """),
+                        {
+                            "id": email_log_id,
+                            "org_id": request.organization_id,
+                            "customer_id": customer_id,
+                            "campaign_id": None,
+                            "mkt_campaign_id": getattr(request, "marketing_campaign_id", None),
+                            "email_type": email_type_val,
+                            "subject": request.subject,
+                            "body": final_html_body,
+                            "has_attachment": has_attachment,
+                            "graph_message_id": sent_meta_pre.get("id"),
+                            "conversation_id": sent_meta_pre.get("conversation_id"),
+                            "thread_id": sent_meta_pre.get("conversation_id"),
+                            "internet_message_id": sent_meta_pre.get("internet_message_id"),
+                            "references": request.references,
+                            "in_reply_to": request.in_reply_to
+                        }
+                    )
+                    await write_db.commit()
+                
+                return EmailResponse(
+                    success=True,
+                    message_id=sent_meta_pre.get("id"),
+                    sent_at=datetime.now(timezone.utc).isoformat()
+                )
+        except Exception as provider_recovery_err:
+            logger.warning("Provider recovery sentitems query failed or returned empty", error=str(provider_recovery_err))
+
+        # 4. Dispatch Email via Provider
+        message_id = "N/A"
         try:
             if is_reply_expected:
                 if not parent_graph_message_id:
@@ -650,6 +884,7 @@ class EmailService:
                     raise EmailSendError(error_msg)
                     
                 async with StepTracker(6, "Send Threaded Reply"):
+                    # No DB session here. Provider uses pre_resolved_token/settings.
                     message_id = await self._send_threaded_reply(
                         request=request,
                         provider=provider,
@@ -663,6 +898,7 @@ class EmailService:
                     )
             else:
                 async with StepTracker(6, "Send Email"):
+                    # No DB session here. Provider uses pre_resolved_token/settings.
                     message_id = await self._send_new_email(
                         request=request,
                         provider=provider,
@@ -678,26 +914,11 @@ class EmailService:
             log_to_request_file(f"Email Send Success: message_id={message_id}")
         except Exception as e:
             handle_diagnostic_failure("Send Email", e, locals())
-            if parent_graph_message_id:
-                try:
-                    await self.session.execute(
-                        text("""
-                            UPDATE email_log
-                            SET delivery_status = 'delivered'
-                            WHERE organization_id = :org_id
-                              AND direction = 'inbound'
-                              AND graph_message_id = :parent_id
-                              AND delivery_status = 'queued'
-                        """),
-                        {"org_id": request.organization_id, "parent_id": parent_graph_message_id}
-                    )
-                    await self.session.commit()
-                except Exception as revert_ex:
-                    logger.warning("Failed to revert inbound email delivery_status on error", error=str(revert_ex))
-            await self.session.rollback()
             raise e
 
-        # Retrieve true message details from Sent Items dynamically
+        # ==========================================
+        # TRANSACTION B: LOG WRITE & OUTCOME RECORDING
+        # ==========================================
         true_msg_id = message_id
         true_conv_id = request.conversation_id or request.thread_id
         true_thread_id = request.thread_id or request.conversation_id
@@ -707,106 +928,52 @@ class EmailService:
             true_thread_id = message_id
         if not true_conv_id:
             true_conv_id = message_id
-            
-        true_index = None
-        
-        try:
-            logger.info("Attempting to retrieve sent message metadata from Sent Items folder")
-            sent_meta = await provider.get_sent_metadata(
-                org_id=request.organization_id,
-                subject=request.subject,
-                to_email=request.customer_email,
-                db_session=self.session
-            )
-            if sent_meta.get("retrieval_success"):
-                true_msg_id = sent_meta.get("id") or true_msg_id
-                true_conv_id = sent_meta.get("conversation_id") or true_conv_id
-                true_thread_id = sent_meta.get("conversation_id") or true_thread_id
-                true_internet_id = sent_meta.get("internet_message_id") or true_internet_id
-                true_index = sent_meta.get("conversation_index")
-                
-                logger.info(
-                    "Outbound Email Audit - Graph Message Persisted",
-                    conversationId=true_conv_id,
-                    internetMessageId=true_internet_id,
-                    id=true_msg_id,
-                    conversationIndex=true_index,
-                    retrieval_success=True,
-                    retrieval_time_ms=sent_meta.get("retrieval_time_ms")
-                )
-            else:
-                logger.warning(
-                    "Outbound Email Audit - Sent Items retrieval failed or timed out",
-                    retrieval_success=False,
-                    retrieval_time_ms=sent_meta.get("retrieval_time_ms", 0)
-                )
-        except Exception as meta_ex:
-            logger.warning("Failed to query Sent Items metadata", error=str(meta_ex), retrieval_success=False)
 
-        # STEP 7: Save Email History
-        logger.info("INSERT email_log")
-        log_to_request_file("Executing: INSERT email_log")
+        # Query Sent Items folder for metadata — no DB session needed (uses pre_resolved_token).
+        # Optimization: Only query Sent Items for Microsoft Graph provider where thread IDs are required.
+        # SMTP already has exact Message-ID and requires zero blocking WAN folder polling.
+        if provider_type == "microsoft":
+            try:
+                sent_meta = await provider.get_sent_metadata(
+                    org_id=request.organization_id,
+                    subject=request.subject,
+                    to_email=request.customer_email,
+                    db_session=None
+                )
+                if sent_meta.get("retrieval_success"):
+                    true_msg_id = sent_meta.get("id") or true_msg_id
+                    true_conv_id = sent_meta.get("conversation_id") or true_conv_id
+                    true_thread_id = sent_meta.get("conversation_id") or true_thread_id
+                    true_internet_id = sent_meta.get("internet_message_id") or true_internet_id
+            except Exception as meta_ex:
+                logger.warning("Failed to query Sent Items metadata", error=str(meta_ex))
+
+        # Insert email_log inside Transaction B
         try:
-            async with StepTracker(7, "Save Email History"):
+            async with AsyncSessionLocal() as write_db:
                 email_log_id = uuid.uuid4()
                 has_attachment = len(request.attachments) > 0 if request.attachments else False
-
-                # Resolve campaign_id and email_type dynamically from current scheduler state
-                email_type_val = "engagement"
-                campaign_id_val = None
-                if customer_id:
-                    # 1. Check if there is an active/pending follow-up schedule item for this customer
-                    step_res = await self.session.execute(
-                        text("""
-                            SELECT campaign_id 
-                            FROM follow_up_schedule 
-                            WHERE customer_id = :cust_id 
-                              AND organization_id = :org_id 
-                              AND status::text IN ('pending', 'scheduled', 'paused')
-                            ORDER BY step_number ASC 
-                            LIMIT 1
-                        """),
-                        {"cust_id": customer_id, "org_id": request.organization_id}
-                    )
-                    step_row = step_res.fetchone()
-                    if step_row:
-                        email_type_val = "followup"
-                        campaign_id_val = step_row[0]
-                    
-                    # 2. Fallback to active campaign enrollment
-                    if not campaign_id_val:
-                        enroll_res = await self.session.execute(
-                            text("""
-                                SELECT campaign_id 
-                                FROM campaign_enrollments 
-                                WHERE customer_id = :cust_id 
-                                  AND organization_id = :org_id 
-                                  AND enrollment_status = 'active'
-                                LIMIT 1
-                            """),
-                            {"cust_id": customer_id, "org_id": request.organization_id}
-                        )
-                        enroll_row = enroll_res.fetchone()
-                        if enroll_row:
-                            campaign_id_val = enroll_row[0]
-
-                await self.session.execute(
+                email_type_val = "campaign" if getattr(request, "marketing_campaign_id", None) else "engagement"
+                
+                # ON CONFLICT DO NOTHING ensures database-level uniqueness locks
+                await write_db.execute(
                     text("""
                         INSERT INTO email_log (
-                            id, organization_id, customer_id, campaign_id, direction, 
+                            id, organization_id, customer_id, campaign_id, marketing_campaign_id, direction, 
                             email_type, subject, body, has_attachment, sent_at, delivery_status, graph_message_id,
                             conversation_id, thread_id, internet_message_id, "references", in_reply_to, created_at
                         ) VALUES (
-                            :id, :org_id, :customer_id, :campaign_id, 'outbound', 
+                            :id, :org_id, :customer_id, :campaign_id, :mkt_campaign_id, 'outbound', 
                             CAST(:email_type AS public.email_type), :subject, :body, :has_attachment, NOW(), 'sent', :graph_message_id,
                             :conversation_id, :thread_id, :internet_message_id, :references, :in_reply_to, NOW()
-                        )
+                        ) ON CONFLICT (marketing_campaign_id, customer_id) WHERE marketing_campaign_id IS NOT NULL DO NOTHING
                     """),
                     {
                         "id": email_log_id,
                         "org_id": request.organization_id,
                         "customer_id": customer_id,
-                        "campaign_id": campaign_id_val,
+                        "campaign_id": None,
+                        "mkt_campaign_id": getattr(request, "marketing_campaign_id", None),
                         "email_type": email_type_val,
                         "subject": request.subject,
                         "body": final_html_body,
@@ -819,28 +986,12 @@ class EmailService:
                         "in_reply_to": request.in_reply_to
                     }
                 )
-                logger.info("FLUSH")
-                await self.session.flush()
+                await write_db.commit()
                 email_log_insert_completed = True
-                log_to_request_file("Email log insert result: Success")
         except Exception as e:
-            handle_diagnostic_failure("Save Email History", e, locals())
-            await self.session.rollback()
+            handle_diagnostic_failure("Save Email History inside Transaction B", e, locals())
             raise e
 
-        # STEP 8: Commit
-        logger.info("COMMIT")
-        log_to_request_file("Executing: COMMIT")
-        try:
-            async with StepTracker(8, "Commit"):
-                await self.session.commit()
-                log_to_request_file("Commit result: Success")
-        except Exception as e:
-            handle_diagnostic_failure("Commit", e, locals())
-            await self.session.rollback()
-            raise e
-
-        # STEP 9: Verify Response Serialization
         try:
             response = EmailResponse(
                 success=True,
@@ -849,7 +1000,6 @@ class EmailService:
             )
             logger.info(response.model_dump())
             log_to_request_file(f"Response returned to FastAPI:\n{response.model_dump_json(indent=2)}")
-            print(f"Returning EmailResponse success={response.success} message_id={response.message_id} sent_at={response.sent_at}", flush=True)
             return response
         except Exception as serialization_error:
             handle_diagnostic_failure("Response Serialization", serialization_error, locals())

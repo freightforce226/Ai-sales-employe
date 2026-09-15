@@ -1,58 +1,67 @@
+import asyncio
 import uuid
 import time
 from datetime import datetime, timezone
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.db.session import AsyncSessionLocal
 from app.providers import EmailProviderFactory
 from app.schemas.inbound_message import InboundMessage
+from app.services.bounce_detection_service import BounceDetectionService
 
 logger = get_logger(__name__)
 
 class InboundSyncService:
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession = None):
         self.db = db
-        self.provider_factory = EmailProviderFactory(db)
+        if db:
+            self.provider_factory = EmailProviderFactory(db)
+        else:
+            self.provider_factory = None
 
     async def sync_all_active_mailboxes(self, organization_ids: list = None) -> dict:
         """
-        Main runner: loads all active integrations, performs isolated sync,
-        and aggregates processed statistics. Optionally filters by organization_ids.
+        Main runner: loads all active integrations, performs concurrent isolated sync
+        with bounded semaphore, short-lived DB sessions, and aggregates processed statistics.
         """
         start_time = time.time()
-        # Load active mailboxes with cursors and provider info
-        query = """
-            SELECT id, organization_id, mailbox_email, last_graph_delta_link, last_sync_cursor, provider 
-            FROM tenant_integrations 
-            WHERE is_active = true
-        """
-        params = {}
-        if organization_ids:
-            query += " AND organization_id = ANY(:org_ids)"
-            params["org_ids"] = list(organization_ids)
+        
+        # 1. Fetch active integrations using a short-lived DB session
+        async with AsyncSessionLocal() as session:
+            query = """
+                SELECT id, organization_id, mailbox_email, last_graph_delta_link, last_sync_cursor, provider 
+                FROM tenant_integrations 
+                WHERE is_active = true
+            """
+            params = {}
+            if organization_ids:
+                query += " AND organization_id = ANY(:org_ids)"
+                params["org_ids"] = list(organization_ids)
 
-        res = await self.db.execute(text(query), params)
-        integrations = res.fetchall()
+            res = await session.execute(text(query), params)
+            integrations = res.fetchall()
+
+            # Log skipped inactive mailboxes for visibility
+            inactive_query = """
+                SELECT mailbox_email, organization_id 
+                FROM tenant_integrations 
+                WHERE is_active = false
+            """
+            if organization_ids:
+                inactive_query += " AND organization_id = ANY(:org_ids)"
+            
+            inactive_res = await session.execute(text(inactive_query), params)
+            for inactive_row in inactive_res.fetchall():
+                logger.info(
+                    "Skipping synchronization because the mailbox integration is inactive.",
+                    org_id=str(inactive_row[1]),
+                    mailbox=inactive_row[0],
+                    reason="is_active = false"
+                )
 
         logger.info(f"Loaded {len(integrations)} active tenant integrations for synchronization.")
-
-        # Log skipped inactive mailboxes for visibility
-        inactive_query = """
-            SELECT mailbox_email, organization_id 
-            FROM tenant_integrations 
-            WHERE is_active = false
-        """
-        if organization_ids:
-            inactive_query += " AND organization_id = ANY(:org_ids)"
-        
-        inactive_res = await self.db.execute(text(inactive_query), params)
-        for inactive_row in inactive_res.fetchall():
-            logger.info(
-                "Skipping synchronization because the mailbox integration is inactive.",
-                org_id=str(inactive_row[1]),
-                mailbox=inactive_row[0],
-                reason="is_active = false"
-            )
 
         stats = {
             "organizations_processed": 0,
@@ -70,113 +79,235 @@ class InboundSyncService:
             "duration_seconds": 0
         }
 
-        for row in integrations:
-            integration_id = row[0]
-            org_id = row[1]
-            mailbox_email = row[2]
-            graph_delta_link = row[3]
-            smtp_sync_cursor = row[4]
-            provider_type = row[5] # 'microsoft_graph' or 'smtp'
+        if not integrations:
+            stats["duration_seconds"] = int(time.time() - start_time)
+            return stats
 
-            # Select the appropriate cursor with strict separation of concerns (no fallback)
-            sync_state = graph_delta_link if provider_type == 'microsoft_graph' else smtp_sync_cursor
+        # 2. Concurrency setup with Bounded Semaphore
+        settings = get_settings()
+        semaphore = asyncio.Semaphore(settings.max_concurrent_org_syncs)
 
-            logger.info("Initializing inbox delta sync for mailbox", org_id=str(org_id), mailbox=mailbox_email, provider=provider_type)
-            try:
-                # 1. Update sync_started_at
-                await self.db.execute(text("""
+        async def _run_tenant_sync(row):
+            async with semaphore:
+                return await self.sync_single_tenant_integration(row)
+
+        results = await asyncio.gather(*[_run_tenant_sync(row) for row in integrations], return_exceptions=True)
+
+        for res in results:
+            if isinstance(res, Exception):
+                err_msg = f"Integration sync worker error: {str(res)}"
+                stats["errors"].append(err_msg)
+                logger.error("Unhandled integration worker exception", error=str(res))
+            elif isinstance(res, dict):
+                stats["mailboxes_processed"] += res.get("mailboxes_processed", 0)
+                stats["organizations_processed"] += res.get("organizations_processed", 0)
+                stats["messages_scanned"] += res.get("messages_scanned", 0)
+                stats["messages_inserted"] += res.get("messages_inserted", 0)
+                stats["duplicates_skipped"] += res.get("duplicates_skipped", 0)
+                stats["reply_detected"] += res.get("reply_detected", 0)
+                stats["schedules_completed"] += res.get("schedules_completed", 0)
+                stats["campaigns_completed"] += res.get("campaigns_completed", 0)
+                stats["messages_skipped_unknown_sender"] += res.get("messages_skipped_unknown_sender", 0)
+                stats["reply_candidates"] += res.get("reply_candidates", 0)
+                stats["reply_matches"] += res.get("reply_matches", 0)
+                if res.get("error"):
+                    stats["errors"].append(res["error"])
+
+        stats["duration_seconds"] = int(time.time() - start_time)
+        return stats
+
+    async def sync_single_tenant_integration(self, row: tuple) -> dict:
+        """
+        Isolated sync worker for a single tenant integration.
+        Uses short-lived sessions and isolated error handling.
+        """
+        integration_id = row[0]
+        org_id = row[1]
+        mailbox_email = row[2]
+        graph_delta_link = row[3]
+        smtp_sync_cursor = row[4]
+        provider_type = row[5] # 'microsoft_graph' or 'smtp'
+
+        sync_state = graph_delta_link if provider_type == 'microsoft_graph' else smtp_sync_cursor
+
+        t_stats = {
+            "organizations_processed": 0,
+            "mailboxes_processed": 0,
+            "messages_scanned": 0,
+            "messages_inserted": 0,
+            "duplicates_skipped": 0,
+            "reply_detected": 0,
+            "schedules_completed": 0,
+            "campaigns_completed": 0,
+            "messages_skipped_unknown_sender": 0,
+            "reply_candidates": 0,
+            "reply_matches": 0,
+            "error": None
+        }
+
+        logger.info("Initializing inbox delta sync for mailbox", org_id=str(org_id), mailbox=mailbox_email, provider=provider_type)
+
+        try:
+            # Step A: Update sync_started_at using dedicated session
+            async with AsyncSessionLocal() as session:
+                await session.execute(text("""
                     UPDATE tenant_integrations
                     SET sync_started_at = NOW(),
                         updated_at = NOW()
                     WHERE id = :id
                 """), {"id": integration_id})
-                await self.db.commit()
+                await session.commit()
 
-                # 2. Resolve provider dynamically via factory
-                logger.info("INSTRUMENT: Resolving provider dynamically via factory...")
-                provider = await self.provider_factory.get_provider_for_tenant(org_id)
-                logger.info("INSTRUMENT: Provider resolved successfully.", provider_class=str(provider.__class__))
-
-                # 3. Fetch messages using abstract provider sync capability returning InboundSyncResult
-                logger.info("INSTRUMENT: Fetching inbound messages from provider...", sync_state=sync_state)
+            # Step B: Perform external provider network sync (NO DB SESSION HELD DURING I/O)
+            async with AsyncSessionLocal() as session:
+                factory = EmailProviderFactory(session)
+                provider = await factory.get_provider_for_tenant(org_id)
                 sync_res = await provider.sync_inbound_emails(
                     org_id=org_id,
                     sync_state=sync_state,
-                    db_session=self.db
+                    db_session=session
                 )
-                logger.info("INSTRUMENT: sync_inbound_emails returned successfully.", num_messages=len(sync_res.messages) if sync_res else 0)
-                messages = sync_res.messages
-                new_cursor = sync_res.new_cursor
 
-                stats["mailboxes_processed"] += 1
-                stats["organizations_processed"] += 1
+            messages = sync_res.messages
+            new_cursor = sync_res.new_cursor
 
-                # 4. Process each message
-                for msg in messages:
-                    stats["messages_scanned"] += 1
-                    logger.info("INSTRUMENT: Processing inbound message...", provider_msg_id=msg.provider_message_id)
-                    processed = await self._process_inbound_message(org_id, msg, mailbox_email)
-                    logger.info("INSTRUMENT: Inbound message processed.", inserted=processed["inserted"])
+            t_stats["mailboxes_processed"] = 1
+            t_stats["organizations_processed"] = 1
+
+            if not messages:
+                # Update cursor state even if no new messages were found
+                async with AsyncSessionLocal() as session:
+                    if provider_type == 'microsoft_graph':
+                        await session.execute(text("""
+                            UPDATE tenant_integrations
+                            SET last_graph_delta_link = :cursor,
+                                sync_completed_at = NOW(),
+                                last_successful_sync = NOW(),
+                                last_sync_error = NULL,
+                                updated_at = NOW()
+                            WHERE id = :id
+                        """), {"id": integration_id, "cursor": new_cursor})
+                    else:
+                        await session.execute(text("""
+                            UPDATE tenant_integrations
+                            SET last_sync_cursor = :cursor,
+                                sync_completed_at = NOW(),
+                                last_successful_sync = NOW(),
+                                last_sync_error = NULL,
+                                updated_at = NOW()
+                            WHERE id = :id
+                        """), {"id": integration_id, "cursor": new_cursor})
+                    await session.commit()
+                return t_stats
+
+            # Step C: Priority Reply Ordering & Bounded Batch Limit
+            # 1. Sort by received_at DESC
+            messages.sort(key=lambda m: m.received_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+            # 2. Prioritize likely customer replies (has in_reply_to or references) over generic messages
+            reply_msgs = [m for m in messages if m.in_reply_to or m.references]
+            other_msgs = [m for m in messages if not (m.in_reply_to or m.references)]
+            ordered_messages = reply_msgs + other_msgs
+
+            settings = get_settings()
+            max_batch_size = settings.inbound_sync_max_batch_size
+            dev_limit = settings.inbound_dev_limit
+            should_advance_cursor = True
+
+            # 3. Apply development limit or bounded batch size
+            if dev_limit and dev_limit > 0 and len(ordered_messages) > dev_limit:
+                logger.info(f"Applying INBOUND_DEV_LIMIT: processing first {dev_limit} messages out of {len(ordered_messages)}. Cursor will NOT advance.")
+                ordered_messages = ordered_messages[:dev_limit]
+                should_advance_cursor = False
+            elif max_batch_size and max_batch_size > 0 and len(ordered_messages) > max_batch_size:
+                logger.info(f"Backlog detected: bounding batch to {max_batch_size} messages out of {len(ordered_messages)} total fetched.")
+                ordered_messages = ordered_messages[:max_batch_size]
+
+            # Determine actual checkpoint value based on processed batch
+            batch_cursor = new_cursor
+            if provider_type != 'microsoft_graph' and ordered_messages:
+                # For IMAP, set cursor strictly to the highest UID present in the processed batch
+                processed_uids = [int(m.provider_message_id) for m in ordered_messages if m.provider_message_id and m.provider_message_id.isdigit()]
+                if processed_uids:
+                    batch_cursor = str(max(processed_uids))
+
+            # Step D: Process messages using dedicated short-lived DB session
+            async with AsyncSessionLocal() as session:
+                worker_service = InboundSyncService(db=session)
+                for msg in ordered_messages:
+                    t_stats["messages_scanned"] += 1
+                    processed = await worker_service._process_inbound_message(org_id, msg, mailbox_email)
+
                     if processed["inserted"]:
-                        stats["messages_inserted"] += 1
+                        t_stats["messages_inserted"] += 1
                     elif processed["skipped"]:
-                        stats["duplicates_skipped"] += 1
+                        t_stats["duplicates_skipped"] += 1
                     elif processed.get("skipped_unknown_sender"):
-                        stats["messages_skipped_unknown_sender"] += 1
+                        t_stats["messages_skipped_unknown_sender"] += 1
 
                     if processed["reply_detected"]:
-                        stats["reply_detected"] += 1
-                        stats["reply_matches"] += 1
+                        t_stats["reply_detected"] += 1
+                        t_stats["reply_matches"] += 1
                     if processed.get("reply_candidate"):
-                        stats["reply_candidates"] += 1
+                        t_stats["reply_candidates"] += 1
                     if processed.get("schedule_completed"):
-                        stats["schedules_completed"] += 1
+                        t_stats["schedules_completed"] += 1
                     if processed.get("campaign_completed"):
-                        stats["campaigns_completed"] += 1
+                        t_stats["campaigns_completed"] += 1
 
-                # 5. Update completed state and delta links based on provider type
-                if provider_type == 'microsoft_graph':
-                    await self.db.execute(text("""
-                        UPDATE tenant_integrations
-                        SET last_graph_delta_link = :cursor,
-                            sync_completed_at = NOW(),
-                            last_successful_sync = NOW(),
-                            last_sync_error = NULL,
-                            updated_at = NOW()
-                        WHERE id = :id
-                    """), {"id": integration_id, "cursor": new_cursor})
+                # Step E: Update completed state and cursor ONLY IF processing succeeded completely
+                if should_advance_cursor and batch_cursor:
+                    if provider_type == 'microsoft_graph':
+                        await session.execute(text("""
+                            UPDATE tenant_integrations
+                            SET last_graph_delta_link = :cursor,
+                                sync_completed_at = NOW(),
+                                last_successful_sync = NOW(),
+                                last_sync_error = NULL,
+                                updated_at = NOW()
+                            WHERE id = :id
+                        """), {"id": integration_id, "cursor": batch_cursor})
+                    else:
+                        await session.execute(text("""
+                            UPDATE tenant_integrations
+                            SET last_sync_cursor = :cursor,
+                                sync_completed_at = NOW(),
+                                last_successful_sync = NOW(),
+                                last_sync_error = NULL,
+                                updated_at = NOW()
+                            WHERE id = :id
+                        """), {"id": integration_id, "cursor": batch_cursor})
                 else:
-                    await self.db.execute(text("""
+                    await session.execute(text("""
                         UPDATE tenant_integrations
-                        SET last_sync_cursor = :cursor,
-                            sync_completed_at = NOW(),
+                        SET sync_completed_at = NOW(),
                             last_successful_sync = NOW(),
                             last_sync_error = NULL,
                             updated_at = NOW()
                         WHERE id = :id
-                    """), {"id": integration_id, "cursor": new_cursor})
-                await self.db.commit()
+                    """), {"id": integration_id})
+                await session.commit()
 
-            except Exception as e:
-                await self.db.rollback()
-                err_msg = f"Mailbox {mailbox_email} failed: {str(e)}"
-                stats["errors"].append(err_msg)
-                logger.error("Failed to sync mailbox", org_id=str(org_id), mailbox=mailbox_email, error=str(e))
-                
-                try:
-                    await self.db.execute(text("""
+
+        except Exception as e:
+            err_msg = f"Mailbox {mailbox_email} failed: {str(e)}"
+            t_stats["error"] = err_msg
+            logger.error("Failed to sync mailbox", org_id=str(org_id), mailbox=mailbox_email, error=str(e))
+            
+            try:
+                async with AsyncSessionLocal() as session:
+                    await session.execute(text("""
                         UPDATE tenant_integrations
                         SET last_sync_error = :err,
                             updated_at = NOW()
                         WHERE id = :id
                     """), {"id": integration_id, "err": str(e)})
-                    await self.db.commit()
-                except Exception as inner_err:
-                    logger.error("Failed to write sync error to database", error=str(inner_err))
-                    await self.db.rollback()
+                    await session.commit()
+            except Exception as inner_err:
+                logger.error("Failed to write sync error to database", error=str(inner_err))
 
-        stats["duration_seconds"] = int(time.time() - start_time)
-        return stats
+        return t_stats
+
 
     async def _process_inbound_message(self, org_id: uuid.UUID, msg: InboundMessage, mailbox_email: str = "unknown_mailbox") -> dict:
         """
@@ -189,7 +320,8 @@ class InboundSyncService:
             "reply_candidate": False,
             "reply_detected": False,
             "schedule_completed": False,
-            "campaign_completed": False
+            "campaign_completed": False,
+            "bounce_recorded": False,
         }
         graph_message_id = msg.provider_message_id
         internet_message_id = msg.internet_message_id
@@ -219,6 +351,33 @@ class InboundSyncService:
         from_email = msg.from_email
         if not from_email:
             return result
+
+        # ── Phase 2A: Bounce / DSN Detection ──────────────────────────────
+        # Must run BEFORE the unknown-sender check because MAILER-DAEMON
+        # is never in the customers table, so it would otherwise be silently
+        # discarded.
+        try:
+            bounce_svc = BounceDetectionService(db=self.db)
+            bounce_result = await bounce_svc.process(msg)
+            if bounce_result["is_bounce"]:
+                result["bounce_recorded"] = bool(bounce_result["matched_email_log_id"])
+                # Always skip further inbound processing for DSN messages –
+                # they are not real customer replies.
+                result["skipped_unknown_sender"] = True
+                logger.info(
+                    "DSN/bounce message processed",
+                    is_bounce=True,
+                    bounce_type=bounce_result.get("bounce_type"),
+                    matched=bounce_result["matched_email_log_id"] is not None,
+                    mailbox=mailbox_email,
+                )
+                return result
+        except Exception as bounce_err:
+            logger.error(
+                "BounceDetectionService raised an unexpected error; continuing with normal processing",
+                error=str(bounce_err),
+            )
+        # ── End Phase 2A ───────────────────────────────────────────────────
 
         # Retrieve matching customer
         cust_check = await self.db.execute(text("""
@@ -287,7 +446,7 @@ class InboundSyncService:
         # Update last_contact_date on customers table using received_at timestamp
         await self.db.execute(text("""
             UPDATE customers
-            SET last_contact_date = :received_at::date,
+            SET last_contact_date = CAST(:received_at AS date),
                 updated_at = NOW()
             WHERE id = :cust_id AND organization_id = :org_id
         """), {
@@ -352,6 +511,8 @@ class InboundSyncService:
         settings_row = settings_res.fetchone()
         stop_on_reply = bool(settings_row[0]) if settings_row else False
 
+        from app.core.config import get_settings
+        outbound_limit = get_settings().reply_detection_outbound_limit
         # Load previous outbound emails sent to this customer from this organization
         outbound_res = await self.db.execute(text("""
             SELECT id, sent_at, subject, conversation_id, internet_message_id 
@@ -361,7 +522,8 @@ class InboundSyncService:
               AND direction = 'outbound'
               AND email_type IN ('engagement', 'followup')
             ORDER BY sent_at DESC
-        """), {"cust_id": customer_id, "org_id": org_id})
+            LIMIT :outbound_limit
+        """), {"cust_id": customer_id, "org_id": org_id, "outbound_limit": outbound_limit})
         outbound_emails = outbound_res.fetchall()
 
         if not outbound_emails:

@@ -43,7 +43,8 @@ class BaseEmailProvider(ABC):
         bcc_emails: List[str],
         attachments: List[Dict[str, Any]],
         db_session: AsyncSession,
-        sender_display_name: Optional[str] = None
+        sender_display_name: Optional[str] = None,
+        subject: Optional[str] = None
     ) -> str:
         """
         Sends a reply threaded under a parent message.

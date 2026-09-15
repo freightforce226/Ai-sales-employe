@@ -20,8 +20,10 @@ class AttachmentItem(BaseModel):
 
 class EmailRequest(BaseModel):
     organization_id: UUID4 = Field(..., description="The ID of the organization sending the email")
-    customer_email: EmailStr = Field(..., description="The recipient's email address")
+    customer_email: Optional[EmailStr] = Field(None, description="The recipient's email address")
+    customer_id: Optional[UUID4] = Field(None, description="The recipient customer ID (used to resolve email if missing)")
     subject: str = Field(..., min_length=1)
+
     body: Optional[str] = Field(None, description="Legacy fallback body")
     html_body: Optional[str] = Field(None, description="HTML body content")
     plain_text_body: Optional[str] = Field(None, description="Plain text fallback body")
@@ -37,6 +39,7 @@ class EmailRequest(BaseModel):
     references: Optional[str] = Field(None, description="RFC5322 references header value")
     in_reply_to: Optional[str] = Field(None, description="RFC5322 in-reply-to message ID")
     parent_message_id: Optional[str] = Field(None, description="Graph ID of parent message to reply to")
+    marketing_campaign_id: Optional[UUID4] = Field(None, description="The ID of the marketing campaign (for isolation and tracking)")
 
 
     @field_validator("customer_email", mode="before")
@@ -63,6 +66,11 @@ class EmailResponse(BaseModel):
     success: bool
     message_id: Optional[str] = None
     sent_at: Optional[str] = None
+    # Phase 2B – Hard-Bounce Suppression fields (backward-compatible: default False/None).
+    # When skipped=True the recipient was intentionally not sent to due to a confirmed
+    # hard bounce. This is NOT a send failure and should NOT trigger retries.
+    skipped: bool = False
+    skip_reason: Optional[str] = None
 
 
 class EmailErrorResponse(BaseModel):

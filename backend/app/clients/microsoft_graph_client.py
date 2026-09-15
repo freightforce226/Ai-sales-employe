@@ -6,6 +6,7 @@ Handling email delivery, API retries, rate limits, and Microsoft Graph specific 
 """
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 import httpx
 from tenacity import (
@@ -129,11 +130,14 @@ class MicrosoftGraphClient:
         
         url = delta_link
         if not url:
+            from app.core.config import get_settings
+            page_size = get_settings().graph_delta_page_size
             since_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
             url = (
                 f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?"
                 f"$filter=receivedDateTime ge {since_date}"
                 f"&$select=id,subject,body,conversationId,internetMessageId,replyTo,from,toRecipients,receivedDateTime,hasAttachments"
+                f"&$top={page_size}"
             )
             
         messages = []
@@ -175,10 +179,14 @@ class MicrosoftGraphClient:
                         if new_delta_link:
                             break
                     
-                    # Fetch singleValueExtendedProperties for each message individually since delta does not support expand
-                    for msg in messages:
+                    # Fetch singleValueExtendedProperties for each message concurrently since delta does not support expand
+                    sem = asyncio.Semaphore(15)
+                    
+                    async def fetch_detail(msg):
                         msg_id = msg.get("id")
-                        if msg_id:
+                        if not msg_id:
+                            return
+                        async with sem:
                             logger.info("Fetching singleValueExtendedProperties for delta message", message_id=msg_id)
                             detail_url = f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}?$expand=singleValueExtendedProperties($filter=id eq 'String 0x1042' or id eq 'String 0x1039')"
                             try:
@@ -190,6 +198,8 @@ class MicrosoftGraphClient:
                                     logger.warning("Failed to fetch extended properties for message", message_id=msg_id, status_code=detail_res.status_code)
                             except Exception as detail_err:
                                 logger.warning("Error fetching extended properties for message", message_id=msg_id, error=str(detail_err))
+                                
+                    await asyncio.gather(*(fetch_detail(msg) for msg in messages))
                                 
                 break # Success, exit retry loop
             except (httpx.RequestError, GraphApiError) as e:

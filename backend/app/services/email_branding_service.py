@@ -186,13 +186,17 @@ class EmailBrandingService:
                 formatted_body
             )
 
-        # Build Banner HTML using public signed CDN URL
-        # Check if the signature is already in the body using BeautifulSoup
+        # Check if the signature or banner image is already in the body using BeautifulSoup / text search
         has_existing_sig = False
-        if body_content and signature_html:
+        if body_content:
             from bs4 import BeautifulSoup
             soup_body = BeautifulSoup(body_content, "html.parser")
-            if soup_body.find(id="org-signature") or soup_body.find(class_="signature-block"):
+            if (
+                soup_body.find(id="org-signature") 
+                or soup_body.find(class_="signature-block")
+                or "cid:signature_image" in body_content
+                or (banner_url and banner_url in body_content)
+            ):
                 has_existing_sig = True
         
         # Apply inline style wrapper to signature
@@ -218,6 +222,11 @@ class EmailBrandingService:
         if banner_url and not has_existing_sig:
             banner_html = f'<div style="margin-top:24px;"><img src="{banner_url}" alt="Banner" style="max-width:100%;height:auto;border:0;display:block;" /></div>'
             logger.info("SIGNATURE RENDER ENGINE - APPENDED BANNER TAG", banner_url=banner_url, img_tag=banner_html)
+
+        # Conditionally construct signature container block only if signature or banner HTML exists
+        sig_container = ""
+        if styled_signature or banner_html:
+            sig_container = f'<div style="border-top:1px solid #eeeeee;padding-top:16px;margin-top:24px;">{styled_signature}{banner_html}</div>'
 
         # Full responsive envelope template
         html_template = f"""<!DOCTYPE html>
@@ -246,10 +255,7 @@ class EmailBrandingService:
               <div style="margin-bottom:24px;">
                 {formatted_body}
               </div>
-              <div style="border-top:1px solid #eeeeee;padding-top:16px;margin-top:24px;">
-                {styled_signature}
-                {banner_html}
-              </div>
+              {sig_container}
             </td>
           </tr>
         </table>

@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     ai_reply_lock_timeout_minutes: int = 15
     smtp_debug_logging: bool = False
 
+    # Inbound Sync Optimization Settings
+    max_concurrent_org_syncs: int = 3
+    graph_delta_page_size: int = 50
+    reply_detection_outbound_limit: int = 20
+    inbound_dev_limit: int | None = None
+    inbound_sync_max_batch_size: int = 100
+
+
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.allowed_origins.split(",")]

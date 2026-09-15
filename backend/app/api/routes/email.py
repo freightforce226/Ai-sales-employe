@@ -9,17 +9,19 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import verify_api_key
-from app.db.session import get_db_session
+from app.db.session import AsyncSessionLocal
 from app.schemas.email import EmailRequest, EmailResponse
 from app.services.email_service import EmailService
+import asyncio
 
 router = APIRouter(prefix="/api/v1/email", tags=["Email"])
+
+email_sending_semaphore = asyncio.Semaphore(5)
 
 
 @router.post("/send", response_model=EmailResponse, dependencies=[Depends(verify_api_key)])
 async def send_email(
     request: EmailRequest,
-    session: AsyncSession = Depends(get_db_session),
 ):
     """
     Send an email via Microsoft Graph API for a specific tenant.
@@ -41,5 +43,7 @@ async def send_email(
     # Stage 2: Pydantic model
     log_to_request_file(f"Attachment Lifecycle Stage 2 - Validated Pydantic Attachment Model Count: {len(request.attachments)} | Filenames: {[a.filename for a in request.attachments]}")
     
-    email_service = EmailService(session)
-    return await email_service.send_tenant_email(request)
+    async with email_sending_semaphore:
+        async with AsyncSessionLocal() as session:
+            email_service = EmailService(session)
+            return await email_service.send_tenant_email(request)

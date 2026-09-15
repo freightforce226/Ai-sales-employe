@@ -23,7 +23,7 @@ class CustomerRepository:
         if segment:
             query_str += " JOIN customer_segments cs ON c.id = cs.customer_id AND cs.organization_id = :org_id"
             
-        query_str += " WHERE c.organization_id = :org_id AND c.deleted_at IS NULL"
+        query_str += " WHERE c.organization_id = :org_id AND c.deleted_at IS NULL AND (c.email_validation_status IS NULL OR c.email_validation_status != 'invalid')"
         params = {"org_id": self.org_id}
  
         if q:
@@ -46,29 +46,44 @@ class CustomerRepository:
         # Data Query
         select_fields = """
             SELECT c.id, c.company_name, c.contact_name, c.contact_email, c.industry, c.country, 
+                   c.designation, c.phone, c.website, c.linkedin, c.address, c.city, c.state, 
+                   c.shipment_mode, c.trade_direction, c.customer_type, c.trade_region, 
+                   c.goods_description, c.raw_company_name, c.raw_contact_name,
                    (SELECT cs2.segment_type FROM customer_segments cs2 WHERE cs2.customer_id = c.id ORDER BY cs2.computed_at DESC LIMIT 1) as segment_type,
                    c.last_contact_date, c.created_at,
                    (SELECT CAST(ce.enrollment_status AS VARCHAR) FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as enrollment_status,
-                   (SELECT ce.exit_reason FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as exit_reason
+                   (SELECT ce.exit_reason FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as exit_reason,
+                   c.email_validation_status,
+                   (SELECT es.id FROM email_suppressions es WHERE es.organization_id = :org_id AND lower(es.email_address) = lower(c.contact_email) LIMIT 1) as suppression_id,
+                   (SELECT es.reason FROM email_suppressions es WHERE es.organization_id = :org_id AND lower(es.email_address) = lower(c.contact_email) LIMIT 1) as suppression_reason,
+                   (SELECT es.bounce_reason FROM email_suppressions es WHERE es.organization_id = :org_id AND lower(es.email_address) = lower(c.contact_email) LIMIT 1) as bounce_reason,
+                   (SELECT es.suppressed_at FROM email_suppressions es WHERE es.organization_id = :org_id AND lower(es.email_address) = lower(c.contact_email) LIMIT 1) as suppressed_at
         """
         data_query = text(f"{select_fields} {query_str} ORDER BY c.created_at DESC LIMIT :limit OFFSET :offset")
         params["limit"] = limit
         params["offset"] = offset
- 
+
         res = await self.db.execute(data_query, params)
         rows = res.fetchall()
- 
+
         return rows, total
 
     async def get_customer_by_id(self, customer_id: UUID) -> Optional[Any]:
         res = await self.db.execute(
             text("""
                 SELECT c.id, c.company_name, c.contact_name, c.contact_email, c.industry, c.country, 
+                       c.designation, c.phone, c.website, c.linkedin, c.address, c.city, c.state, 
+                       c.shipment_mode, c.trade_direction, c.customer_type, c.trade_region, 
+                       c.goods_description, c.raw_company_name, c.raw_contact_name,
                        (SELECT cs2.segment_type FROM customer_segments cs2 WHERE cs2.customer_id = c.id ORDER BY cs2.computed_at DESC LIMIT 1) as segment_type,
                        c.last_contact_date, c.created_at, c.import_batch_id,
                        ib.file_name, ib.created_at,
                        (SELECT CAST(ce.enrollment_status AS VARCHAR) FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as enrollment_status,
-                       (SELECT ce.exit_reason FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as exit_reason
+                       (SELECT ce.exit_reason FROM campaign_enrollments ce WHERE ce.customer_id = c.id ORDER BY ce.created_at DESC LIMIT 1) as exit_reason,
+                       (SELECT es.id FROM email_suppressions es WHERE es.organization_id = :org_id AND lower(es.email_address) = lower(c.contact_email) LIMIT 1) as suppression_id,
+                       (SELECT es.reason FROM email_suppressions es WHERE es.organization_id = :org_id AND lower(es.email_address) = lower(c.contact_email) LIMIT 1) as suppression_reason,
+                       (SELECT es.bounce_reason FROM email_suppressions es WHERE es.organization_id = :org_id AND lower(es.email_address) = lower(c.contact_email) LIMIT 1) as bounce_reason,
+                       (SELECT es.suppressed_at FROM email_suppressions es WHERE es.organization_id = :org_id AND lower(es.email_address) = lower(c.contact_email) LIMIT 1) as suppressed_at
                 FROM customers c
                 LEFT JOIN import_batches ib ON c.import_batch_id = ib.id AND ib.organization_id = :org_id
                 WHERE c.id = :id AND c.organization_id = :org_id AND c.deleted_at IS NULL
@@ -111,7 +126,7 @@ class CustomerRepository:
 
     async def delete_customer(self, customer_id: UUID) -> bool:
         res = await self.db.execute(
-            text("UPDATE customers SET deleted_at = NOW() WHERE id = :id AND organization_id = :org_id AND deleted_at IS NULL"),
+            text("DELETE FROM customers WHERE id = :id AND organization_id = :org_id"),
             {"id": customer_id, "org_id": self.org_id}
         )
         return res.rowcount > 0
@@ -121,9 +136,8 @@ class CustomerRepository:
             return 0
         res = await self.db.execute(
             text("""
-                UPDATE customers 
-                SET deleted_at = NOW() 
-                WHERE id = ANY(:ids) AND organization_id = :org_id AND deleted_at IS NULL
+                DELETE FROM customers 
+                WHERE id = ANY(:ids) AND organization_id = :org_id
             """),
             {"ids": list(customer_ids), "org_id": self.org_id}
         )
